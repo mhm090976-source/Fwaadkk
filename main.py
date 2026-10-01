@@ -1,11 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import feedparser
-from datetime import datetime
 
 app = FastAPI()
 
-# تفعيل CORS لتسمح للواجهة بالاتصال بالسيرفر بدون مشاكل
+# تفعيل CORS لتسمح للواجهة بالاتصال بالسيرفر
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,7 +13,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# قائمة روابط RSS الخاصة بالفوركس والأسواق المالية
+# قائمة مصادر RSS
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -24,7 +23,7 @@ RSS_FEEDS = {
     "Yahoo Finance Currency": "https://finance.yahoo.com/news/rssindex"
 }
 
-# الكلمات المفتاحية الخاصة بالفوركس والعملات والاقتصاد
+# الكلمات المفتاحية المخصصة لتصفية أخبار الفوركس والاقتصاد
 FOREX_KEYWORDS = [
     'forex', 'fx', 'dollar', 'euro', 'pound', 'yen', 'usd', 'eur', 'gbp', 'jpy', 'aud', 'cad', 'chf',
     'fed', 'ecb', 'boe', 'boj', 'inflation', 'interest rate', 'central bank', 'cpi', 'nfp', 'currency',
@@ -32,7 +31,7 @@ FOREX_KEYWORDS = [
 ]
 
 def is_forex_news(title):
-    """التحقق مما إذا كان العنوان يحتوي على كلمات تخص الفوركس"""
+    """تصفية الأخبار بناءً على الكلمات المفتاحية"""
     title_lower = title.lower()
     return any(keyword in title_lower for keyword in FOREX_KEYWORDS)
 
@@ -47,18 +46,25 @@ def get_forex_news():
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:10]: # أخذ أول 10 أخبار من كل مصدر
+            for entry in feed.entries[:10]:
                 title = entry.get("title", "")
                 
-                # تصفية الأخبار: استبعاد الأخبار التي لا تتضمن كلمات فوركس
                 if is_forex_news(title):
+                    # استخراج رابط الصورة إن وجد في الـ RSS
+                    image_url = ""
+                    if "media_content" in entry and len(entry.media_content) > 0:
+                        image_url = entry.media_content[0].get("url", "")
+                    elif "enclosures" in entry and len(entry.enclosures) > 0:
+                        image_url = entry.enclosures[0].get("href", "")
+
                     all_news.append({
                         "title": title,
                         "link": entry.get("link", "#"),
                         "published": entry.get("published", entry.get("updated", "مؤخراً")),
-                        "source": source_name
+                        "source": source_name,
+                        "image": image_url
                     })
-        except Exception as e:
+        except Exception:
             continue
 
     return {
