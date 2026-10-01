@@ -118,16 +118,45 @@ def home():
     return {"status": "online", "message": "Forex Radar API is Running"}
 
 @app.get("/api/news")
-def get_forex_news():
+async def get_forex_news():
     all_news = []
     current_time_ms = int(time.time() * 1000)
     
+    # 1. جلب أحداث المفكرة الاقتصادية الحقيقية (Economic Calendar Data)
+    # نقوم بطلب البيانات من مصدر مخصص للأجندة الاقتصادية أو محاكاة جلب الجدول الزمني الرسمي
+    try:
+        async with httpx.AsyncClient() as client:
+            # مثال على جلب جدول اقتصادي متاح للعامة أو عبر API مباشر
+            cal_res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5.0)
+            if cal_res.status_code == 200:
+                events = cal_res.json()
+                for ev in events:
+                    if ev.get("impact") in ["High", "Medium"]:
+                        # تحويل وقت الحدث إلى Milliseconds
+                        # الفوركس فاكتوري يزودنا بالتاريخ والوقت بصيغة ISO
+                        import datetime
+                        dt = datetime.datetime.fromisoformat(ev.get("date").replace("Z", "+00:00"))
+                        event_timestamp = int(dt.timestamp() * 1000)
+                        
+                        if event_timestamp > current_time_ms:
+                            all_news.append({
+                                "title": f"{ev.get('country')} - {ev.get('title')}",
+                                "link": "https://www.forexfactory.com/calendar",
+                                "published": f"موعد الصدور: {ev.get('date')}",
+                                "source": "Forex Factory Calendar",
+                                "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                                "impact": "high" if ev.get("impact") == "High" else "medium",
+                                "target_timestamp": event_timestamp
+                            })
+    except Exception as e:
+        print("Calendar fetch error:", e)
+
+    # 2. جلب الأخبار الحية من الـ RSS وتدمج مع الجدول
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for idx, entry in enumerate(feed.entries[:10]):
+            for entry in feed.entries[:5]:
                 title = entry.get("title", "")
-                
                 if is_forex_news(title):
                     image_url = ""
                     if "media_content" in entry and len(entry.media_content) > 0:
@@ -135,24 +164,14 @@ def get_forex_news():
                     elif "enclosures" in entry and len(entry.enclosures) > 0:
                         image_url = entry.enclosures[0].get("href", "")
 
-                    impact = get_impact_level(title)
-                    
-                    # تخصيص وقت مستقبلي حقيقي بالأخبار عالية التأثير ليعمل العداد بدقة
-                    # (مثلاً: ترتيب الخبر يحدد بعد كم دقيقة سيكون الحدث القادم)
-                    target_timestamp = None
-                    if impact == "high":
-                        # إضافة وقت مستقبلي تدريجي لكل خبر عالي التأثير (مثلاً يبعد من 30 دقيقة إلى ساعتين)
-                        offset_minutes = 30 + (idx * 15)
-                        target_timestamp = current_time_ms + (offset_minutes * 60 * 1000)
-
                     all_news.append({
                         "title": title,
                         "link": entry.get("link", "#"),
                         "published": entry.get("published", entry.get("updated", "recent")),
                         "source": source_name,
                         "image": image_url,
-                        "impact": impact,
-                        "target_timestamp": target_timestamp
+                        "impact": get_impact_level(title),
+                        "target_timestamp": None
                     })
         except Exception:
             continue
