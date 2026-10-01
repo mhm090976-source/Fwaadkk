@@ -16,7 +16,7 @@ app.add_middleware(
 # --- مسار توثيق ملكية الدومين لـ Cryptomus ---
 @app.get("/cryptomus_b9c7b8dd.html", response_class=PlainTextResponse)
 def cryptomus_verification():
-    return "cryptomus_b9c7b8dd"
+    return "cryptomus=b9c7b8dd"
 
 
 RSS_FEEDS = {
