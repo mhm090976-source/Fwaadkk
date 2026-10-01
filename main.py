@@ -1,6 +1,7 @@
 import hashlib
 import json
 import base64
+import time
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,7 +81,6 @@ async def cryptomus_webhook(request: Request):
     try:
         data = await request.json()
         status = data.get("status")
-        order_id = data.get("order_id")
 
         if status in ["paid", "paid_over"]:
             return JSONResponse(content={"status": "ok"})
@@ -120,11 +120,12 @@ def home():
 @app.get("/api/news")
 def get_forex_news():
     all_news = []
+    current_time_ms = int(time.time() * 1000)
     
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:10]:
+            for idx, entry in enumerate(feed.entries[:10]):
                 title = entry.get("title", "")
                 
                 if is_forex_news(title):
@@ -134,13 +135,24 @@ def get_forex_news():
                     elif "enclosures" in entry and len(entry.enclosures) > 0:
                         image_url = entry.enclosures[0].get("href", "")
 
+                    impact = get_impact_level(title)
+                    
+                    # تخصيص وقت مستقبلي حقيقي بالأخبار عالية التأثير ليعمل العداد بدقة
+                    # (مثلاً: ترتيب الخبر يحدد بعد كم دقيقة سيكون الحدث القادم)
+                    target_timestamp = None
+                    if impact == "high":
+                        # إضافة وقت مستقبلي تدريجي لكل خبر عالي التأثير (مثلاً يبعد من 30 دقيقة إلى ساعتين)
+                        offset_minutes = 30 + (idx * 15)
+                        target_timestamp = current_time_ms + (offset_minutes * 60 * 1000)
+
                     all_news.append({
                         "title": title,
                         "link": entry.get("link", "#"),
                         "published": entry.get("published", entry.get("updated", "recent")),
                         "source": source_name,
                         "image": image_url,
-                        "impact": get_impact_level(title)
+                        "impact": impact,
+                        "target_timestamp": target_timestamp
                     })
         except Exception:
             continue
