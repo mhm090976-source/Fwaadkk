@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import feedparser
 
 app = FastAPI()
@@ -11,6 +12,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- مسار توثيق ملكية الدومين لـ Cryptomus ---
+@app.get("/cryptomus_b9c7b8dd.html", response_class=PlainTextResponse)
+def cryptomus_verification():
+    return "cryptomus_b9c7b8dd"
+
 
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
