@@ -4,7 +4,6 @@ import feedparser
 
 app = FastAPI()
 
-# تفعيل CORS لتسمح للواجهة بالاتصال بالسيرفر
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,7 +12,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# قائمة مصادر RSS
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -23,21 +21,26 @@ RSS_FEEDS = {
     "Yahoo Finance Currency": "https://finance.yahoo.com/news/rssindex"
 }
 
-# الكلمات المفتاحية المخصصة لتصفية أخبار الفوركس والاقتصاد
-FOREX_KEYWORDS = [
-    'forex', 'fx', 'dollar', 'euro', 'pound', 'yen', 'usd', 'eur', 'gbp', 'jpy', 'aud', 'cad', 'chf',
-    'fed', 'ecb', 'boe', 'boj', 'inflation', 'interest rate', 'central bank', 'cpi', 'nfp', 'currency',
-    'trade', 'treasury', 'yield', 'powell', 'lagarde', 'monetary'
-]
+# كلمات مفتاحية للأخبار عالية التأثير جداً
+HIGH_IMPACT = ['fed', 'interest rate', 'cpi', 'nfp', 'powell', 'inflation', 'ecb', 'central bank', 'fomc', 'gdp']
+# كلمات مفتاحية للأخبار متوسطة التأثير
+MEDIUM_IMPACT = ['dollar', 'euro', 'pound', 'yen', 'usd', 'eur', 'gbp', 'jpy', 'trade', 'retail', 'jobless', 'treasury', 'yield']
+
+def get_impact_level(title):
+    title_lower = title.lower()
+    if any(k in title_lower for k in HIGH_IMPACT):
+        return "high"
+    elif any(k in title_lower for k in MEDIUM_IMPACT):
+        return "medium"
+    return "low"
 
 def is_forex_news(title):
-    """تصفية الأخبار بناءً على الكلمات المفتاحية"""
     title_lower = title.lower()
-    return any(keyword in title_lower for keyword in FOREX_KEYWORDS)
+    return any(k in title_lower for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency']))
 
 @app.get("/")
 def home():
-    return {"status": "online", "message": "Forex News API is running"}
+    return {"status": "online", "message": "Forex News High-Impact API is running"}
 
 @app.get("/api/news")
 def get_forex_news():
@@ -50,7 +53,6 @@ def get_forex_news():
                 title = entry.get("title", "")
                 
                 if is_forex_news(title):
-                    # استخراج رابط الصورة إن وجد في الـ RSS
                     image_url = ""
                     if "media_content" in entry and len(entry.media_content) > 0:
                         image_url = entry.media_content[0].get("url", "")
@@ -62,7 +64,8 @@ def get_forex_news():
                         "link": entry.get("link", "#"),
                         "published": entry.get("published", entry.get("updated", "مؤخراً")),
                         "source": source_name,
-                        "image": image_url
+                        "image": image_url,
+                        "impact": get_impact_level(title) # تحديد الأهمية
                     })
         except Exception:
             continue
