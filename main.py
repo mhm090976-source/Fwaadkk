@@ -1,7 +1,6 @@
 import hashlib
 import json
 import base64
-import time
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +80,7 @@ async def cryptomus_webhook(request: Request):
     try:
         data = await request.json()
         status = data.get("status")
+        order_id = data.get("order_id")
 
         if status in ["paid", "paid_over"]:
             return JSONResponse(content={"status": "ok"})
@@ -118,45 +118,15 @@ def home():
     return {"status": "online", "message": "Forex Radar API is Running"}
 
 @app.get("/api/news")
-async def get_forex_news():
+def get_forex_news():
     all_news = []
-    current_time_ms = int(time.time() * 1000)
     
-    # 1. جلب أحداث المفكرة الاقتصادية الحقيقية (Economic Calendar Data)
-    # نقوم بطلب البيانات من مصدر مخصص للأجندة الاقتصادية أو محاكاة جلب الجدول الزمني الرسمي
-    try:
-        async with httpx.AsyncClient() as client:
-            # مثال على جلب جدول اقتصادي متاح للعامة أو عبر API مباشر
-            cal_res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5.0)
-            if cal_res.status_code == 200:
-                events = cal_res.json()
-                for ev in events:
-                    if ev.get("impact") in ["High", "Medium"]:
-                        # تحويل وقت الحدث إلى Milliseconds
-                        # الفوركس فاكتوري يزودنا بالتاريخ والوقت بصيغة ISO
-                        import datetime
-                        dt = datetime.datetime.fromisoformat(ev.get("date").replace("Z", "+00:00"))
-                        event_timestamp = int(dt.timestamp() * 1000)
-                        
-                        if event_timestamp > current_time_ms:
-                            all_news.append({
-                                "title": f"{ev.get('country')} - {ev.get('title')}",
-                                "link": "https://www.forexfactory.com/calendar",
-                                "published": f"موعد الصدور: {ev.get('date')}",
-                                "source": "Forex Factory Calendar",
-                                "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                "impact": "high" if ev.get("impact") == "High" else "medium",
-                                "target_timestamp": event_timestamp
-                            })
-    except Exception as e:
-        print("Calendar fetch error:", e)
-
-    # 2. جلب الأخبار الحية من الـ RSS وتدمج مع الجدول
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]:
+            for entry in feed.entries[:10]:
                 title = entry.get("title", "")
+                
                 if is_forex_news(title):
                     image_url = ""
                     if "media_content" in entry and len(entry.media_content) > 0:
@@ -170,8 +140,7 @@ async def get_forex_news():
                         "published": entry.get("published", entry.get("updated", "recent")),
                         "source": source_name,
                         "image": image_url,
-                        "impact": get_impact_level(title),
-                        "target_timestamp": None
+                        "impact": get_impact_level(title)
                     })
         except Exception:
             continue
