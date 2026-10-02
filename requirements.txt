@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-feedparser
+flask
+firebase-admin
 httpx
+feedparser
