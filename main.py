@@ -17,7 +17,6 @@ app = Flask(__name__)
 CORS(app)
 
 # --- 1. تهيئة الذاكرة المؤقتة (Cache) ---
-# ستحفظ الأخبار ووقت آخر تحديث
 NEWS_CACHE = {
     "data": [],
     "last_updated": 0
@@ -28,7 +27,8 @@ CACHE_DURATION_SECONDS = 7 * 60  # 7 دقائق
 # --- 2. تهيئة Firebase ---
 db = None
 try:
-    firebase_admin.initialize_app()
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
     db = firestore.client()
     print("Firebase initialized successfully.")
 except Exception as e:
@@ -114,7 +114,6 @@ def cryptomus_webhook():
 # --- 4. إعدادات جلب الأخبار ---
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
-    "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
     "MarketWatch Forex": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "DailyFX": "https://www.dailyfx.com/feeds/market-news",
     "FXStreet": "https://www.fxstreet.com/rss/news",
@@ -162,13 +161,12 @@ def fetch_single_feed(source_name, feed_url):
         pass
     return items
 
-# --- 5. دالة تحديث الأخبار في الخلفية تلقائياً ---
+# --- 5. دالة تحديث الأخبار الآمنة ---
 def update_news_cache_job():
     global NEWS_CACHE
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
-    # أ) جلب تقويم Forex Factory
     try:
         with httpx.Client() as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=4.0)
@@ -196,25 +194,23 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
             all_news.extend(future.result())
 
-    # ج) تحديث الذاكرة المؤقتة
     if all_news:
         NEWS_CACHE["data"] = all_news
         NEWS_CACHE["last_updated"] = time.time()
         print(f"[{datetime.datetime.now()}] Cache Updated! Total items: {len(all_news)}")
 
-# --- 6. تشغيل المجدول (Background Scheduler) كل 30 ثانية ---
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30)
-scheduler.start()
-
-# تشغيل أول جلب عند بداية التشغيل
-update_news_cache_job()
+# --- 6. تشغيل المجدول بشكل آمن ---
+try:
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30)
+    scheduler.start()
+except Exception as e:
+    print("Scheduler error:", e)
 
 # --- 7. المسارات الرئيسية ---
 @app.route("/")
@@ -227,16 +223,15 @@ def home():
     except Exception as e:
         print("Firestore Fetch Error:", e)
 
-    return render_template('index.html', news_list=news_list)
+    return jsonify({"status": "live", "database_articles": news_list})
 
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     now = time.time()
-    # إذا كانت البيانات أقدم من 7 دقائق ولا توجد بيانات، قم بالتحديث التلقائي
+    # إذا كانت القائمة فارغة قم بالتحديث فوراً
     if not NEWS_CACHE["data"] or (now - NEWS_CACHE["last_updated"] > CACHE_DURATION_SECONDS):
         update_news_cache_job()
 
-    # إرجاع البيانات المحفوظة في الذاكرة فوراً (استجابة فائقة السرعة!)
     return jsonify({
         "status": "success",
         "total_results": len(NEWS_CACHE["data"]),
@@ -246,4 +241,4 @@ def get_forex_news():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
