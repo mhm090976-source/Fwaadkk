@@ -3,26 +3,29 @@ import json
 import base64
 import time
 import datetime
+import os
 import httpx
 import feedparser
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, JSONResponse
+import concurrent.futures
+from flask import Flask, render_template, request, jsonify, Response
+from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
 import firebase_admin
 from firebase_admin import firestore
 
-app = FastAPI(title="Forex Radar API")
+app = Flask(__name__)
+CORS(app)
 
-# إعدادات CORS المدمجة في FastAPI
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- 1. تهيئة الذاكرة المؤقتة (Cache) ---
+# ستحفظ الأخبار ووقت آخر تحديث
+NEWS_CACHE = {
+    "data": [],
+    "last_updated": 0
+}
 
-# --- 1. تهيئة Firebase ---
+CACHE_DURATION_SECONDS = 7 * 60  # 7 دقائق
+
+# --- 2. تهيئة Firebase ---
 db = None
 try:
     firebase_admin.initialize_app()
@@ -31,13 +34,13 @@ try:
 except Exception as e:
     print("Firebase initialization skipped or failed:", e)
 
-# --- 2. إعدادات Cryptomus ---
+# --- 3. إعدادات Cryptomus ---
 CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
 CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"
 
-@app.get("/cryptomus_b9c7b8dd.html", response_class=PlainTextResponse)
+@app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
 def cryptomus_verification():
-    return "cryptomus=b9c7b8dd"
+    return Response("cryptomus=b9c7b8dd", mimetype="text/plain")
 
 def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     json_data = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
@@ -45,10 +48,14 @@ def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     sign_str = base64_data + api_key
     return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
 
-@app.post("/api/create-invoice")
-async def create_subscription_invoice(amount: str = "10.00", order_id: str = "SUB_1001"):
+@app.route("/api/create-invoice", methods=["POST"])
+def create_subscription_invoice():
     if CRYPTOMUS_PAYMENT_KEY == "YOUR_PAYMENT_API_KEY_HERE":
-        raise HTTPException(status_code=400, detail="Cryptomus Payment Key is missing")
+        return jsonify({"status": "error", "message": "Cryptomus Payment Key is missing"}), 400
+
+    req_data = request.json or {}
+    amount = req_data.get("amount", "10.00")
+    order_id = req_data.get("order_id", "SUB_1001")
 
     payload = {
         "amount": amount,
@@ -63,6 +70,7 @@ async def create_subscription_invoice(amount: str = "10.00", order_id: str = "SU
     }
 
     signature = generate_cryptomus_signature(payload, CRYPTOMUS_PAYMENT_KEY)
+
     headers = {
         "merchant": CRYPTOMUS_MERCHANT_ID,
         "sign": signature,
@@ -70,8 +78,8 @@ async def create_subscription_invoice(amount: str = "10.00", order_id: str = "SU
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        with httpx.Client() as client:
+            response = client.post(
                 "https://api.cryptomus.com/v1/payment",
                 json=payload,
                 headers=headers,
@@ -80,27 +88,30 @@ async def create_subscription_invoice(amount: str = "10.00", order_id: str = "SU
 
         res_data = response.json()
         if response.status_code == 200 and res_data.get("state") == 0:
-            return {
+            return jsonify({
                 "status": "success",
                 "payment_url": res_data["result"]["url"],
                 "invoice_id": res_data["result"]["uuid"]
-            }
-        return {"status": "error", "message": res_data.get("message", "Failed")}
+            })
+        else:
+            return jsonify({"status": "error", "message": res_data.get("message", "Failed")})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.post("/api/cryptomus-webhook")
-async def cryptomus_webhook(request: Request):
+@app.route("/api/cryptomus-webhook", methods=["POST"])
+def cryptomus_webhook():
     try:
-        data = await request.json()
+        data = request.json or {}
         status = data.get("status")
-        if status in ["paid", "paid_over"]:
-            return {"status": "ok"}
-        return {"status": "ignored"}
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
 
-# --- 3. إعدادات الأخبار والتقويم ---
+        if status in ["paid", "paid_over"]:
+            return jsonify({"status": "ok"})
+
+        return jsonify({"status": "ignored"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# --- 4. إعدادات جلب الأخبار ---
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -125,26 +136,42 @@ def is_forex_news(title):
     title_lower = title.lower()
     return any(k in title_lower for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency']))
 
-@app.get("/")
-def home():
-    news_list = []
+def fetch_single_feed(source_name, feed_url):
+    items = []
     try:
-        if db:
-            articles_ref = db.collection('articles').stream()
-            news_list = [doc.to_dict() for doc in articles_ref]
-    except Exception as e:
-        print("Firestore Fetch Error:", e)
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries[:5]:
+            title = entry.get("title", "")
+            if is_forex_news(title):
+                image_url = ""
+                if "media_content" in entry and len(entry.media_content) > 0:
+                    image_url = entry.media_content[0].get("url", "")
+                elif "enclosures" in entry and len(entry.enclosures) > 0:
+                    image_url = entry.enclosures[0].get("href", "")
 
-    return {"status": "online", "message": "Forex Radar API is Running", "database_articles": news_list}
+                items.append({
+                    "title": title,
+                    "link": entry.get("link", "#"),
+                    "published": entry.get("published", entry.get("updated", "recent")),
+                    "source": source_name,
+                    "image": image_url,
+                    "impact": get_impact_level(title),
+                    "target_timestamp": None
+                })
+    except Exception:
+        pass
+    return items
 
-@app.get("/api/news")
-async def get_forex_news():
+# --- 5. دالة تحديث الأخبار في الخلفية تلقائياً ---
+def update_news_cache_job():
+    global NEWS_CACHE
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
+    # أ) جلب تقويم Forex Factory
     try:
-        async with httpx.AsyncClient() as client:
-            cal_res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5.0)
+        with httpx.Client() as client:
+            cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=4.0)
             if cal_res.status_code == 200:
                 events = cal_res.json()
                 for ev in events:
@@ -169,32 +196,54 @@ async def get_forex_news():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    for source_name, feed_url in RSS_FEEDS.items():
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]:
-                title = entry.get("title", "")
-                if is_forex_news(title):
-                    image_url = ""
-                    if "media_content" in entry and len(entry.media_content) > 0:
-                        image_url = entry.media_content[0].get("url", "")
-                    elif "enclosures" in entry and len(entry.enclosures) > 0:
-                        image_url = entry.enclosures[0].get("href", "")
+    # ب) جلب RSS بالتوازي
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
+        for future in concurrent.futures.as_completed(futures):
+            all_news.extend(future.result())
 
-                    all_news.append({
-                        "title": title,
-                        "link": entry.get("link", "#"),
-                        "published": entry.get("published", entry.get("updated", "recent")),
-                        "source": source_name,
-                        "image": image_url,
-                        "impact": get_impact_level(title),
-                        "target_timestamp": None
-                    })
-        except Exception:
-            continue
+    # ج) تحديث الذاكرة المؤقتة
+    if all_news:
+        NEWS_CACHE["data"] = all_news
+        NEWS_CACHE["last_updated"] = time.time()
+        print(f"[{datetime.datetime.now()}] Cache Updated! Total items: {len(all_news)}")
 
-    return {
+# --- 6. تشغيل المجدول (Background Scheduler) كل 30 ثانية ---
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30)
+scheduler.start()
+
+# تشغيل أول جلب عند بداية التشغيل
+update_news_cache_job()
+
+# --- 7. المسارات الرئيسية ---
+@app.route("/")
+def home():
+    news_list = []
+    try:
+        if db:
+            articles_ref = db.collection('articles').stream()
+            news_list = [doc.to_dict() for doc in articles_ref]
+    except Exception as e:
+        print("Firestore Fetch Error:", e)
+
+    return render_template('index.html', news_list=news_list)
+
+@app.route("/api/news", methods=["GET"])
+def get_forex_news():
+    now = time.time()
+    # إذا كانت البيانات أقدم من 7 دقائق ولا توجد بيانات، قم بالتحديث التلقائي
+    if not NEWS_CACHE["data"] or (now - NEWS_CACHE["last_updated"] > CACHE_DURATION_SECONDS):
+        update_news_cache_job()
+
+    # إرجاع البيانات المحفوظة في الذاكرة فوراً (استجابة فائقة السرعة!)
+    return jsonify({
         "status": "success",
-        "total_results": len(all_news),
-        "data": all_news
-    }
+        "total_results": len(NEWS_CACHE["data"]),
+        "data": NEWS_CACHE["data"],
+        "cached_at": NEWS_CACHE["last_updated"]
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, debug=True)
