@@ -6,3 +6,4 @@ httpx
 feedparser
 flask-cors
 APScheduler
+gunicorn
