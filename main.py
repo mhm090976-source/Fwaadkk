@@ -210,15 +210,18 @@ def update_news_cache_job():
 
 # --- 6. تشغيل المجدول (Background Scheduler) كل 30 ثانية ---
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30)
+scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30, max_instances=2)
 scheduler.start()
 
 # تشغيل أول جلب عند بداية التشغيل
 update_news_cache_job()
 
 # --- 7. المسارات الرئيسية ---
-@app.route("/")
+@app.route("/", methods=["GET", "HEAD"])
 def home():
+    if request.method == "HEAD":
+        return Response(status=200)
+
     news_list = []
     try:
         if db:
@@ -227,7 +230,10 @@ def home():
     except Exception as e:
         print("Firestore Fetch Error:", e)
 
-    return render_template('index.html', news_list=news_list)
+    try:
+        return render_template('index.html', news_list=news_list)
+    except Exception:
+        return jsonify({"status": "live", "message": "API Server is running successfully"})
 
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
