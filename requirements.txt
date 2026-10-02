@@ -4,3 +4,6 @@ flask
 firebase-admin
 httpx
 feedparser
+flask-cors
+feedparser
+APScheduler
