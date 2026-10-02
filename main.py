@@ -2,31 +2,28 @@ import hashlib
 import json
 import base64
 import time
-import datetime
 import httpx
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, JSONResponse
 import feedparser
-from flask import Flask, render_template, request, jsonify, Response, redirect
-import firebase_admin
-from firebase_admin import firestore
 
-app = Flask(__name__)
+app = FastAPI()
 
-# --- 1. معالجة تهيئة Firebase بأمان لتفادي توقف Render ---
-db = None
-try:
-    firebase_admin.initialize_app()
-    db = firestore.client()
-    print("Firebase initialized successfully.")
-except Exception as e:
-    print("Firebase initialization skipped or failed:", e)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- 2. إعدادات Cryptomus ---
 CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
-CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"  # ضع مفتاحك الحقيقي هنا من لوحة Cryptomus
+CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"
 
-@app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
+@app.get("/cryptomus_b9c7b8dd.html", response_class=PlainTextResponse)
 def cryptomus_verification():
-    return Response("cryptomus=b9c7b8dd", mimetype="text/plain")
+    return "cryptomus=b9c7b8dd"
 
 def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     json_data = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
@@ -34,14 +31,10 @@ def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     sign_str = base64_data + api_key
     return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
 
-@app.route("/api/create-invoice", methods=["POST"])
-def create_subscription_invoice():
+@app.post("/api/create-invoice")
+async def create_subscription_invoice(amount: str = "10.00", order_id: str = "SUB_1001"):
     if CRYPTOMUS_PAYMENT_KEY == "YOUR_PAYMENT_API_KEY_HERE":
-        return jsonify({"status": "error", "message": "Cryptomus Payment Key is missing"}), 400
-
-    req_data = request.json or {}
-    amount = req_data.get("amount", "10.00")
-    order_id = req_data.get("order_id", "SUB_1001")
+        raise HTTPException(status_code=400, detail="Key missing")
 
     payload = {
         "amount": amount,
@@ -63,44 +56,39 @@ def create_subscription_invoice():
         "Content-Type": "application/json"
     }
 
-    try:
-        with httpx.Client() as client:
-            response = client.post(
-                "https://api.cryptomus.com/v1/payment",
-                json=payload,
-                headers=headers,
-                timeout=10.0
-            )
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.cryptomus.com/v1/payment",
+            json=payload,
+            headers=headers
+        )
 
-        res_data = response.json()
-        if response.status_code == 200 and res_data.get("state") == 0:
-            return jsonify({
-                "status": "success",
-                "payment_url": res_data["result"]["url"],
-                "invoice_id": res_data["result"]["uuid"]
-            })
-        else:
-            return jsonify({
-                "status": "error",
-                "message": res_data.get("message", "Failed")
-            })
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    res_data = response.json()
+    if response.status_code == 200 and res_data.get("state") == 0:
+        return {
+            "status": "success",
+            "payment_url": res_data["result"]["url"],
+            "invoice_id": res_data["result"]["uuid"]
+        }
+    else:
+        return {
+            "status": "error",
+            "message": res_data.get("message", "Failed")
+        }
 
-@app.route("/api/cryptomus-webhook", methods=["POST"])
-def cryptomus_webhook():
+@app.post("/api/cryptomus-webhook")
+async def cryptomus_webhook(request: Request):
     try:
-        data = request.json or {}
+        data = await request.json()
         status = data.get("status")
 
         if status in ["paid", "paid_over"]:
-            return jsonify({"status": "ok"})
+            return JSONResponse(content={"status": "ok"})
 
-        return jsonify({"status": "ignored"})
+        return JSONResponse(content={"status": "ignored"})
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return JSONResponse(content={"error": str(e)}, status_code=400)
 
-# --- 3. إعدادات الأخبار ---
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -125,51 +113,45 @@ def is_forex_news(title):
     title_lower = title.lower()
     return any(k in title_lower for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency']))
 
-# --- 4. الرئيسية مع الحماية من غياب DB ---
-@app.route("/")
+@app.get("/")
 def home():
-    news_list = []
-    try:
-        if db:
-            articles_ref = db.collection('articles').stream()
-            news_list = [doc.to_dict() for doc in articles_ref]
-    except Exception as e:
-        print("Firestore Fetch Error:", e)
+    return {"status": "online", "message": "Forex Radar API is Running"}
 
-    return render_template('index.html', news_list=news_list)
-
-@app.route("/api/news", methods=["GET"])
-def get_forex_news():
+@app.get("/api/news")
+async def get_forex_news():
     all_news = []
     current_time_ms = int(time.time() * 1000)
     
+    # 1. جلب أحداث المفكرة الاقتصادية الحقيقية (Economic Calendar Data)
+    # نقوم بطلب البيانات من مصدر مخصص للأجندة الاقتصادية أو محاكاة جلب الجدول الزمني الرسمي
     try:
-        with httpx.Client() as client:
-            cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5.0)
+        async with httpx.AsyncClient() as client:
+            # مثال على جلب جدول اقتصادي متاح للعامة أو عبر API مباشر
+            cal_res = await client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=5.0)
             if cal_res.status_code == 200:
                 events = cal_res.json()
                 for ev in events:
                     if ev.get("impact") in ["High", "Medium"]:
-                        try:
-                            dt_str = ev.get("date", "").replace("Z", "+00:00")
-                            dt = datetime.datetime.fromisoformat(dt_str)
-                            event_timestamp = int(dt.timestamp() * 1000)
-                            
-                            if event_timestamp > current_time_ms:
-                                all_news.append({
-                                    "title": f"{ev.get('country')} - {ev.get('title')}",
-                                    "link": "https://www.forexfactory.com/calendar",
-                                    "published": f"موعد الصدور: {ev.get('date')}",
-                                    "source": "Forex Factory Calendar",
-                                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                    "impact": "high" if ev.get("impact") == "High" else "medium",
-                                    "target_timestamp": event_timestamp
-                                })
-                        except Exception:
-                            continue
+                        # تحويل وقت الحدث إلى Milliseconds
+                        # الفوركس فاكتوري يزودنا بالتاريخ والوقت بصيغة ISO
+                        import datetime
+                        dt = datetime.datetime.fromisoformat(ev.get("date").replace("Z", "+00:00"))
+                        event_timestamp = int(dt.timestamp() * 1000)
+                        
+                        if event_timestamp > current_time_ms:
+                            all_news.append({
+                                "title": f"{ev.get('country')} - {ev.get('title')}",
+                                "link": "https://www.forexfactory.com/calendar",
+                                "published": f"موعد الصدور: {ev.get('date')}",
+                                "source": "Forex Factory Calendar",
+                                "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                                "impact": "high" if ev.get("impact") == "High" else "medium",
+                                "target_timestamp": event_timestamp
+                            })
     except Exception as e:
         print("Calendar fetch error:", e)
 
+    # 2. جلب الأخبار الحية من الـ RSS وتدمج مع الجدول
     for source_name, feed_url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(feed_url)
@@ -194,24 +176,8 @@ def get_forex_news():
         except Exception:
             continue
 
-    return jsonify({
+    return {
         "status": "success",
         "total_results": len(all_news),
         "data": all_news
-    })
-
-@app.route('/add-sample')
-def add_sample():
-    if not db:
-        return "قاعدة البيانات غير متصلة حالياً.", 400
-    try:
-        db.collection('articles').add({
-            'title': 'تحديثات أسواق العملات والتحليل الفني',
-            'content': 'تستمر الأسواق في تفاعل البيانات الاقتصادية الصادرة حديثاً مع ترقب لتوجيهات البنوك الكبرى.'
-        })
-        return "تم إضافة خبر تجريبي بنجاح! <a href='/'>العودة للصفحة الرئيسية</a>"
-    except Exception as e:
-        return f"حدث خطأ أثناء الإضافة: {str(e)}"
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    }
