@@ -11,37 +11,34 @@ from firebase_admin import firestore
 
 app = Flask(__name__)
 
-# تهيئة قاعدة بيانات Firebase Firestore تلقائياً عبر بيئة Google Cloud Shell / Render
+# --- 1. معالجة تهيئة Firebase بأمان لتفادي توقف Render ---
+db = None
 try:
     firebase_admin.initialize_app()
-except ValueError:
-    pass  # تفادي خطأ التكرار لو تم تهيئتها مسبقاً
+    db = firestore.client()
+    print("Firebase initialized successfully.")
+except Exception as e:
+    print("Firebase initialization skipped or failed:", e)
 
-db = firestore.client()
-
-# إعدادات بوابة الدفع Cryptomus
+# --- 2. إعدادات Cryptomus ---
 CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
-CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"
+CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"  # ضع مفتاحك الحقيقي هنا من لوحة Cryptomus
 
-# 1. مسار التحقق الخاص بـ Cryptomus (مطلوب لقبول الموقع)
 @app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
 def cryptomus_verification():
     return Response("cryptomus=b9c7b8dd", mimetype="text/plain")
 
-# دالة توقيع Cryptomus
 def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     json_data = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
     base64_data = base64.b64encode(json_data).decode('utf-8')
     sign_str = base64_data + api_key
     return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
 
-# 2. مسار إنشاء فاتورة الدفع
 @app.route("/api/create-invoice", methods=["POST"])
 def create_subscription_invoice():
     if CRYPTOMUS_PAYMENT_KEY == "YOUR_PAYMENT_API_KEY_HERE":
-        return jsonify({"status": "error", "message": "Key missing"}), 400
+        return jsonify({"status": "error", "message": "Cryptomus Payment Key is missing"}), 400
 
-    # استلام البيانات أو استخدام قيم افتراضية
     req_data = request.json or {}
     amount = req_data.get("amount", "10.00")
     order_id = req_data.get("order_id", "SUB_1001")
@@ -67,7 +64,6 @@ def create_subscription_invoice():
     }
 
     try:
-        # استخدام httpx بشكل متزامن داخل Flask
         with httpx.Client() as client:
             response = client.post(
                 "https://api.cryptomus.com/v1/payment",
@@ -91,7 +87,6 @@ def create_subscription_invoice():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 3. مسار استقبال الويب هوك (Webhook) من Cryptomus
 @app.route("/api/cryptomus-webhook", methods=["POST"])
 def cryptomus_webhook():
     try:
@@ -99,14 +94,13 @@ def cryptomus_webhook():
         status = data.get("status")
 
         if status in ["paid", "paid_over"]:
-            # هنا يمكنك تحديث حالة الدفع في قاعدة بيانات Firestore إذا رغبت
             return jsonify({"status": "ok"})
 
         return jsonify({"status": "ignored"})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# إعدادات مصادر الأخبار ومستويات الأهمية
+# --- 3. إعدادات الأخبار ---
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -131,20 +125,19 @@ def is_forex_news(title):
     title_lower = title.lower()
     return any(k in title_lower for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency']))
 
-# 4. الصفحة الرئيسية (تربط Flask بقاعدة بيانات Firestore وعرض القالب الاحترافي)
+# --- 4. الرئيسية مع الحماية من غياب DB ---
 @app.route("/")
 def home():
+    news_list = []
     try:
-        # جلب البيانات المخزنة مسبقاً في مجموعة 'articles' بقاعدة بيانات Firestore
-        articles_ref = db.collection('articles').stream()
-        news_list = [doc.to_dict() for doc in articles_ref]
-        
-        # تمرير الأخبار لعرضها في ملف index.html
-        return render_template('index.html', news_list=news_list)
+        if db:
+            articles_ref = db.collection('articles').stream()
+            news_list = [doc.to_dict() for doc in articles_ref]
     except Exception as e:
-        return f"حدث خطأ في الاتصال بقاعدة البيانات أو عرض الصفحة: {str(e)}"
+        print("Firestore Fetch Error:", e)
 
-# 5. مسار جلب الأخبار الحية وجدول الفوركس (API)
+    return render_template('index.html', news_list=news_list)
+
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     all_news = []
@@ -157,19 +150,23 @@ def get_forex_news():
                 events = cal_res.json()
                 for ev in events:
                     if ev.get("impact") in ["High", "Medium"]:
-                        dt = datetime.datetime.fromisoformat(ev.get("date").replace("Z", "+00:00"))
-                        event_timestamp = int(dt.timestamp() * 1000)
-                        
-                        if event_timestamp > current_time_ms:
-                            all_news.append({
-                                "title": f"{ev.get('country')} - {ev.get('title')}",
-                                "link": "https://www.forexfactory.com/calendar",
-                                "published": f"موعد الصدور: {ev.get('date')}",
-                                "source": "Forex Factory Calendar",
-                                "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                "impact": "high" if ev.get("impact") == "High" else "medium",
-                                "target_timestamp": event_timestamp
-                            })
+                        try:
+                            dt_str = ev.get("date", "").replace("Z", "+00:00")
+                            dt = datetime.datetime.fromisoformat(dt_str)
+                            event_timestamp = int(dt.timestamp() * 1000)
+                            
+                            if event_timestamp > current_time_ms:
+                                all_news.append({
+                                    "title": f"{ev.get('country')} - {ev.get('title')}",
+                                    "link": "https://www.forexfactory.com/calendar",
+                                    "published": f"موعد الصدور: {ev.get('date')}",
+                                    "source": "Forex Factory Calendar",
+                                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                                    "impact": "high" if ev.get("impact") == "High" else "medium",
+                                    "target_timestamp": event_timestamp
+                                })
+                        except Exception:
+                            continue
     except Exception as e:
         print("Calendar fetch error:", e)
 
@@ -203,15 +200,16 @@ def get_forex_news():
         "data": all_news
     })
 
-# 6. مسار إضافي لتجربة إضافة خبر لقاعدة البيانات وإثبات نشاط الموقع
 @app.route('/add-sample')
 def add_sample():
+    if not db:
+        return "قاعدة البيانات غير متصلة حالياً.", 400
     try:
         db.collection('articles').add({
             'title': 'تحديثات أسواق العملات والتحليل الفني',
             'content': 'تستمر الأسواق في تفاعل البيانات الاقتصادية الصادرة حديثاً مع ترقب لتوجيهات البنوك الكبرى.'
         })
-        return "تم إضافة خبر تجريبي بنجاح لقاعدة البيانات! <a href='/'>العودة للصفحة الرئيسية</a>"
+        return "تم إضافة خبر تجريبي بنجاح! <a href='/'>العودة للصفحة الرئيسية</a>"
     except Exception as e:
         return f"حدث خطأ أثناء الإضافة: {str(e)}"
 
