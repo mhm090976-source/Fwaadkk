@@ -11,7 +11,7 @@ from flask import Flask, render_template, request, jsonify, Response
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 import firebase_admin
-from firebase_admin import firestore
+from firebase_admin import firestore, messaging
 
 app = Flask(__name__)
 CORS(app)
@@ -25,6 +25,9 @@ NEWS_CACHE = {
 
 CACHE_DURATION_SECONDS = 7 * 60  # 7 دقائق
 
+# تتبع عناوين الأخبار المُنبه عليها سابقاً لتجنب تكرار الإشعارات
+NOTIFIED_NEWS_TITLES = set()
+
 # --- 2. تهيئة Firebase ---
 db = None
 try:
@@ -33,6 +36,45 @@ try:
     print("Firebase initialized successfully.")
 except Exception as e:
     print("Firebase initialization skipped or failed:", e)
+
+# --- دالة إرسال الإشعارات الفورية مع النافذة المنبثقة فوق التطبيقات ---
+def send_high_impact_notification(title, body, event_data=None):
+    """
+    إرسال إشعار فوري ذو أولوية فائقة مع حزمة بيانات تفعيل النافذة العائمة فوق التطبيقات (Overlay Window)
+    """
+    try:
+        data_payload = {
+            "click_action": "FLUTTER_NOTIFICATION_CLICK",
+            "impact": "high",
+            "show_overlay": "true",
+            "title": str(title),
+            "body": str(body)
+        }
+        
+        if event_data:
+            data_payload.update(event_data)
+
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=f"🚨 خبر عاجل: {title}",
+                body=body,
+            ),
+            data=data_payload,
+            topic="high_impact_news",
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    channel_id="high_importance_channel",
+                    priority="high"
+                ),
+            ),
+        )
+
+        response = messaging.send(message)
+        print(f"[{datetime.datetime.now()}] FCM Notification Sent: {response}")
+    except Exception as e:
+        print(f"Error sending FCM notification: {e}")
 
 # --- 3. إعدادات Cryptomus ---
 CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
@@ -164,7 +206,7 @@ def fetch_single_feed(source_name, feed_url):
 
 # --- 5. دالة تحديث الأخبار في الخلفية تلقائياً ---
 def update_news_cache_job():
-    global NEWS_CACHE
+    global NEWS_CACHE, NOTIFIED_NEWS_TITLES
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
@@ -182,13 +224,29 @@ def update_news_cache_job():
                             event_timestamp = int(dt.timestamp() * 1000)
 
                             if event_timestamp > current_time_ms:
+                                news_title = f"{ev.get('country')} - {ev.get('title')}"
+                                impact_type = "high" if ev.get("impact") == "High" else "medium"
+
+                                # إرسال إشعار عاجل عبر Firebase للخبر ذات التأثير العالي لم يُرسل من قبل
+                                if impact_type == "high" and news_title not in NOTIFIED_NEWS_TITLES:
+                                    send_high_impact_notification(
+                                        title=news_title,
+                                        body=f"موعد الصدور المرتقب: {ev.get('date')}",
+                                        event_data={
+                                            "country": str(ev.get('country', '')),
+                                            "forecast": str(ev.get('forecast', '')),
+                                            "previous": str(ev.get('previous', ''))
+                                        }
+                                    )
+                                    NOTIFIED_NEWS_TITLES.add(news_title)
+
                                 all_news.append({
-                                    "title": f"{ev.get('country')} - {ev.get('title')}",
+                                    "title": news_title,
                                     "link": "https://www.forexfactory.com/calendar",
                                     "published": f"موعد الصدور: {ev.get('date')}",
                                     "source": "Forex Factory Calendar",
                                     "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                    "impact": "high" if ev.get("impact") == "High" else "medium",
+                                    "impact": impact_type,
                                     "target_timestamp": event_timestamp
                                 })
                         except Exception:
@@ -200,7 +258,17 @@ def update_news_cache_job():
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
-            all_news.extend(future.result())
+            feed_items = future.result()
+            for item in feed_items:
+                # التأكد من إرسال تنبيه للأخبار القوية من خلاصة الـ RSS
+                if item.get("impact") == "high" and item.get("title") not in NOTIFIED_NEWS_TITLES:
+                    send_high_impact_notification(
+                        title=item.get("source", "خبر عاجل"),
+                        body=item.get("title", ""),
+                        event_data={"link": item.get("link", "")}
+                    )
+                    NOTIFIED_NEWS_TITLES.add(item.get("title"))
+            all_news.extend(feed_items)
 
     # ج) تحديث الذاكرة المؤقتة
     if all_news:
