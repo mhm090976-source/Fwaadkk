@@ -17,15 +17,12 @@ app = Flask(__name__)
 CORS(app)
 
 # --- 1. تهيئة الذاكرة المؤقتة (Cache) ---
-# ستحفظ الأخبار ووقت آخر تحديث
 NEWS_CACHE = {
     "data": [],
     "last_updated": 0
 }
 
-CACHE_DURATION_SECONDS = 7 * 60  # 7 دقائق
-
-# تتبع عناوين الأخبار المُنبه عليها سابقاً لتجنب تكرار الإشعارات
+# تتبع الأخبار المُنبه عليها سابقاً
 NOTIFIED_NEWS_TITLES = set()
 
 # --- 2. تهيئة Firebase ---
@@ -33,9 +30,9 @@ db = None
 try:
     firebase_admin.initialize_app()
     db = firestore.client()
-    print("Firebase initialized successfully.")
+    print("✅ Firebase initialized successfully.")
 except Exception as e:
-    print("Firebase initialization skipped or failed:", e)
+    print("⚠️ Firebase initialization skipped or failed:", e)
 
 # --- دالة إرسال الإشعارات الفورية مع النافذة المنبثقة فوق التطبيقات ---
 def send_high_impact_notification(title, body, event_data=None):
@@ -72,11 +69,35 @@ def send_high_impact_notification(title, body, event_data=None):
         )
 
         response = messaging.send(message)
-        print(f"[{datetime.datetime.now()}] FCM Notification Sent: {response}")
+        print(f"[{datetime.datetime.now()}] 🔔 FCM Notification Sent: {response}")
     except Exception as e:
-        print(f"Error sending FCM notification: {e}")
+        print(f"❌ Error sending FCM notification: {e}")
 
-# --- 3. إعدادات Cryptomus ---
+# --- 3. إدارة وتنظيف قاعدة البيانات (حذف الأخبار الأقدم من أسبوع) ---
+def cleanup_old_news_job():
+    """
+    وظيفة مجدولة تفحص قاعدة البيانات وتلقائياً تحذف كل خبر مر عليه 7 أيام أو أكثر.
+    """
+    if not db:
+        return
+    try:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        one_week_ago = now_utc - datetime.timedelta(days=7)
+        one_week_ago_timestamp = int(one_week_ago.timestamp() * 1000)
+
+        docs = db.collection('articles').where('created_at_ms', '<=', one_week_ago_timestamp).stream()
+        deleted_count = 0
+        
+        for doc in docs:
+            doc.reference.delete()
+            deleted_count += 1
+            
+        if deleted_count > 0:
+            print(f"🧹 [{datetime.datetime.now()}] Auto-Cleanup: Deleted {deleted_count} news items older than 7 days.")
+    except Exception as e:
+        print(f"❌ Error during database cleanup: {e}")
+
+# --- 4. إعدادات Cryptomus ---
 CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
 CRYPTOMUS_PAYMENT_KEY = "YOUR_PAYMENT_API_KEY_HERE"
 
@@ -97,7 +118,7 @@ def create_subscription_invoice():
 
     req_data = request.json or {}
     amount = req_data.get("amount", "10.00")
-    order_id = req_data.get("order_id", "SUB_1001")
+    order_id = req_data.get("order_id", f"SUB_{int(time.time())}")
 
     payload = {
         "amount": amount,
@@ -153,7 +174,7 @@ def cryptomus_webhook():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# --- 4. إعدادات جلب الأخبار ---
+# --- 5. إعدادات جلب الأخبار وسرعة الاستجابة ---
 RSS_FEEDS = {
     "Investing.com Forex": "https://www.investing.com/rss/news_1.rss",
     "Investing.com Central Banks": "https://www.investing.com/rss/news_14.rss",
@@ -165,6 +186,16 @@ RSS_FEEDS = {
 
 HIGH_IMPACT = ['fed', 'interest rate', 'cpi', 'nfp', 'powell', 'inflation', 'ecb', 'central bank', 'fomc', 'gdp']
 MEDIUM_IMPACT = ['dollar', 'euro', 'pound', 'yen', 'usd', 'eur', 'gbp', 'jpy', 'trade', 'retail', 'jobless', 'treasury', 'yield']
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/rss+xml, application/xml, text/xml, */*'
+}
+
+def generate_doc_id(title, source):
+    """توليد معرّف فريد للخبر لمنع التكرار في Firestore"""
+    raw_str = f"{source}_{title}".encode('utf-8')
+    return hashlib.sha256(raw_str).hexdigest()[:20]
 
 def get_impact_level(title):
     title_lower = title.lower()
@@ -181,30 +212,35 @@ def is_forex_news(title):
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
-        feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:5]:
-            title = entry.get("title", "")
-            if is_forex_news(title):
-                image_url = ""
-                if "media_content" in entry and len(entry.media_content) > 0:
-                    image_url = entry.media_content[0].get("url", "")
-                elif "enclosures" in entry and len(entry.enclosures) > 0:
-                    image_url = entry.enclosures[0].get("href", "")
+        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=3.5) as client:
+            res = client.get(feed_url)
+            if res.status_code == 200:
+                feed = feedparser.parse(res.content)
+                for entry in feed.entries[:8]:
+                    title = entry.get("title", "").strip()
+                    if title and is_forex_news(title):
+                        image_url = ""
+                        if "media_content" in entry and len(entry.media_content) > 0:
+                            image_url = entry.media_content[0].get("url", "")
+                        elif "enclosures" in entry and len(entry.enclosures) > 0:
+                            image_url = entry.enclosures[0].get("href", "")
 
-                items.append({
-                    "title": title,
-                    "link": entry.get("link", "#"),
-                    "published": entry.get("published", entry.get("updated", "recent")),
-                    "source": source_name,
-                    "image": image_url,
-                    "impact": get_impact_level(title),
-                    "target_timestamp": None
-                })
+                        items.append({
+                            "doc_id": generate_doc_id(title, source_name),
+                            "title": title,
+                            "link": entry.get("link", "#"),
+                            "published": entry.get("published", entry.get("updated", "recent")),
+                            "source": source_name,
+                            "image": image_url,
+                            "impact": get_impact_level(title),
+                            "target_timestamp": None,
+                            "created_at_ms": int(time.time() * 1000)
+                        })
     except Exception:
         pass
     return items
 
-# --- 5. دالة تحديث الأخبار في الخلفية تلقائياً ---
+# --- 6. دالة تحديث الأخبار والمزامنة اللحظية مع قاعدة البيانات ---
 def update_news_cache_job():
     global NEWS_CACHE, NOTIFIED_NEWS_TITLES
     all_news = []
@@ -212,8 +248,8 @@ def update_news_cache_job():
 
     # أ) جلب تقويم Forex Factory
     try:
-        with httpx.Client() as client:
-            cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=4.0)
+        with httpx.Client(headers=HEADERS, timeout=3.0) as client:
+            cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
             if cal_res.status_code == 200:
                 events = cal_res.json()
                 for ev in events:
@@ -227,7 +263,19 @@ def update_news_cache_job():
                                 news_title = f"{ev.get('country')} - {ev.get('title')}"
                                 impact_type = "high" if ev.get("impact") == "High" else "medium"
 
-                                # إرسال إشعار عاجل عبر Firebase للخبر ذات التأثير العالي لم يُرسل من قبل
+                                item_data = {
+                                    "doc_id": generate_doc_id(news_title, "Forex Factory Calendar"),
+                                    "title": news_title,
+                                    "link": "https://www.forexfactory.com/calendar",
+                                    "published": f"موعد الصدور: {ev.get('date')}",
+                                    "source": "Forex Factory Calendar",
+                                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                                    "impact": impact_type,
+                                    "target_timestamp": event_timestamp,
+                                    "created_at_ms": current_time_ms
+                                }
+
+                                # إرسال إشعار فوري وتزامن لحظي
                                 if impact_type == "high" and news_title not in NOTIFIED_NEWS_TITLES:
                                     send_high_impact_notification(
                                         title=news_title,
@@ -240,27 +288,18 @@ def update_news_cache_job():
                                     )
                                     NOTIFIED_NEWS_TITLES.add(news_title)
 
-                                all_news.append({
-                                    "title": news_title,
-                                    "link": "https://www.forexfactory.com/calendar",
-                                    "published": f"موعد الصدور: {ev.get('date')}",
-                                    "source": "Forex Factory Calendar",
-                                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                    "impact": impact_type,
-                                    "target_timestamp": event_timestamp
-                                })
+                                all_news.append(item_data)
                         except Exception:
                             continue
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+    # ب) جلب RSS بالتوازي الفائق
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
             feed_items = future.result()
             for item in feed_items:
-                # التأكد من إرسال تنبيه للأخبار القوية من خلاصة الـ RSS
                 if item.get("impact") == "high" and item.get("title") not in NOTIFIED_NEWS_TITLES:
                     send_high_impact_notification(
                         title=item.get("source", "خبر عاجل"),
@@ -270,21 +309,36 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
-    # ج) تحديث الذاكرة المؤقتة
+    # ج) المزامنة اللحظية الحية مع Firebase Firestore
+    if db and all_news:
+        try:
+            batch = db.batch()
+            for item in all_news:
+                doc_ref = db.collection('articles').document(item['doc_id'])
+                batch.set(doc_ref, item, merge=True)
+            batch.commit()
+        except Exception as e:
+            print("❌ Firestore Sync Error:", e)
+
+    # د) تحديث الذاكرة المؤقتة لسرعة الـ API
     if all_news:
         NEWS_CACHE["data"] = all_news
         NEWS_CACHE["last_updated"] = time.time()
-        print(f"[{datetime.datetime.now()}] Cache Updated! Total items: {len(all_news)}")
+        print(f"⚡ [{datetime.datetime.now()}] Real-time Sync & Cache Updated! Items: {len(all_news)}")
 
-# --- 6. تشغيل المجدول (Background Scheduler) كل 30 ثانية ---
+# --- 7. تشغيل المجدول الآلي (كل 10 ثوانٍ للجلب، وكل يوم للتنظيف) ---
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=30, max_instances=2)
+# فحص الأخبار والجلب الفوري كل 10 ثوانٍ
+scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
+# تنظيف قاعدة البيانات تلقائياً مرة كل 24 ساعة
+scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
 scheduler.start()
 
-# تشغيل أول جلب عند بداية التشغيل
+# تشغيل الجلب والتنظيف عند بداية الإقلاع
 update_news_cache_job()
+cleanup_old_news_job()
 
-# --- 7. المسارات الرئيسية ---
+# --- 8. المسارات الرئيسية ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
@@ -293,7 +347,7 @@ def home():
     news_list = []
     try:
         if db:
-            articles_ref = db.collection('articles').stream()
+            articles_ref = db.collection('articles').order_by('created_at_ms', direction=firestore.Query.DESCENDING).limit(30).stream()
             news_list = [doc.to_dict() for doc in articles_ref]
     except Exception as e:
         print("Firestore Fetch Error:", e)
@@ -305,12 +359,6 @@ def home():
 
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
-    now = time.time()
-    # إذا كانت البيانات أقدم من 7 دقائق ولا توجد بيانات، قم بالتحديث التلقائي
-    if not NEWS_CACHE["data"] or (now - NEWS_CACHE["last_updated"] > CACHE_DURATION_SECONDS):
-        update_news_cache_job()
-
-    # إرجاع البيانات المحفوظة في الذاكرة فوراً (استجابة فائقة السرعة!)
     return jsonify({
         "status": "success",
         "total_results": len(NEWS_CACHE["data"]),
