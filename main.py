@@ -122,8 +122,10 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
 
         response = messaging.send(message)
         print(f"[{datetime.datetime.now()}] 🔔 FCM Sent ({topic_target}): {response}")
+        return True
     except Exception as e:
         print(f"❌ FCM Notification Error: {e}")
+        return False
 
 # --- 5. إدارة وتنظيف قاعدة البيانات ---
 def cleanup_old_news_job():
@@ -156,7 +158,7 @@ def cryptomus_verification():
 
 def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     json_data = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
-    base64_data = base64.b64encode(json_data).decode('utf-8')
+    base64_data = base64.b64encode(json_data).decode('utf-8').replace("\n", "")
     sign_str = base64_data + api_key
     return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
 
@@ -218,7 +220,6 @@ def cryptomus_webhook():
         order_id = data.get("order_id", "")
 
         if status in ["paid", "paid_over"]:
-            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
             if db and order_id.startswith("SUB_"):
                 parts = order_id.split("_")
                 if len(parts) >= 2:
@@ -235,7 +236,22 @@ def cryptomus_webhook():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# --- 7. إعدادات الخلاصات ومصادر الأخبار المحدثة ---
+# --- 7. مسار اختبار إرسال الإشعار الفوري (Test Notification Endpoint) ---
+@app.route("/api/test-notification", methods=["GET"])
+def test_notification():
+    success = send_high_impact_notification(
+        title="Test Forex Breaking News",
+        title_ar="خبر عاجل تجريبي لاختبار النظام",
+        body="هذا إشعار تجريبي للتأكد من عمل النوافذ العائمة والإشعارات بنجاح.",
+        event_data={"country": "USA", "forecast": "3.5%", "previous": "3.2%"},
+        is_pro_only=False
+    )
+    if success:
+        return jsonify({"status": "success", "message": "Test notification sent successfully!"})
+    else:
+        return jsonify({"status": "error", "message": "Failed to send notification. Check server logs."}), 500
+
+# --- 8. إعدادات الخلاصات ومصادر الأخبار المحدثة ---
 RSS_FEEDS = {
     "ForexLive": "https://www.forexlive.com/feed/news",
     "FXStreet": "https://www.fxstreet.com/rss/news",
@@ -308,13 +324,12 @@ def fetch_single_feed(source_name, feed_url):
         pass
     return items
 
-# --- 8. تحديث الذاكرة والمزامنة اللحظية مع Firebase ---
+# --- 9. تحديث الذاكرة والمزامنة اللحظية مع Firebase ---
 def update_news_cache_job():
     global NEWS_CACHE, NOTIFIED_NEWS_TITLES
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
-    # أ) جلب تقويم Forex Factory
     try:
         with httpx.Client(headers=HEADERS, timeout=3.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
@@ -367,7 +382,6 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -375,7 +389,6 @@ def update_news_cache_job():
             for item in feed_items:
                 if item.get("title") not in NOTIFIED_NEWS_TITLES:
                     is_high = item.get("impact") == "high"
-                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
                     send_high_impact_notification(
                         title=item.get("title"),
                         title_ar=item.get("title_ar"),
@@ -386,7 +399,6 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
-    # ج) الحفظ المجمع في Firebase
     if db and all_news:
         try:
             batch = db.batch()
@@ -402,7 +414,7 @@ def update_news_cache_job():
         NEWS_CACHE["last_updated"] = time.time()
         print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(all_news)} articles processed.")
 
-# --- 9. المجدول الآلي ---
+# --- 10. المجدول الآلي ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
@@ -411,7 +423,7 @@ scheduler.start()
 update_news_cache_job()
 cleanup_old_news_job()
 
-# --- 10. API Endpoints المحدثة ---
+# --- 11. API Endpoints المحدثة ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
