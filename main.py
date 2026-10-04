@@ -34,10 +34,10 @@ try:
 except Exception as e:
     print("⚠️ Firebase initialization skipped or failed:", e)
 
-# --- 3. أدوات التحليل والترجمة الذكية ---
+# --- 3. أدوات التحليل والترجمة الذكية للبيانات الحقيقية ---
 
 def translate_to_arabic(text: str) -> str:
-    """ترجمة العنوان تلقائياً إلى العربية مع معالجة الأخطاء السريعة"""
+    """ترجمة العنوان الحقيقي تلقائياً إلى العربية"""
     if not text:
         return ""
     try:
@@ -47,7 +47,7 @@ def translate_to_arabic(text: str) -> str:
         return text
 
 def extract_currencies_and_tags(title: str) -> list:
-    """استخراج العملات والأزواج المتأثرة من عنوان الخبر"""
+    """استخراج العملات والأزواج المتأثرة من عنوان الخبر الحقيقي"""
     title_upper = title.upper()
     currency_map = {
         'USD': ['USD', 'DOLLAR', 'FED', 'FOMC', 'POWELL', 'PAYROLLS', 'NFP', 'CPI'],
@@ -69,7 +69,7 @@ def extract_currencies_and_tags(title: str) -> list:
     return list(tags) if tags else ['GENERAL']
 
 def analyze_market_sentiment(title: str) -> str:
-    """تحليل الانطباع الأولي للخبر (إيجابي / سلبي / حيادي)"""
+    """تحليل الانطباع الأولي للخبر الحقيقي"""
     title_lower = title.lower()
     bullish_words = ['surge', 'jump', 'rise', 'growth', 'gain', 'bullish', 'hike', 'beat', 'strong', 'positive']
     bearish_words = ['drop', 'fall', 'plunge', 'decline', 'loss', 'bearish', 'cut', 'miss', 'weak', 'negative', 'slump']
@@ -83,11 +83,8 @@ def analyze_market_sentiment(title: str) -> str:
         return "bearish"
     return "neutral"
 
-# --- 4. دالة إرسال الإشعارات الفورية المزودة بتقسيم Pro / Free ---
+# --- 4. دالة إرسال الإشعارات الحقيقية الفورية ---
 def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro_only=False):
-    """
-    إرسال إشعار فوري FCM مع توجيهه حسب نوع اشتراك المستخدم
-    """
     try:
         topic_target = "pro_users_news" if is_pro_only else "high_impact_news"
         
@@ -236,22 +233,22 @@ def cryptomus_webhook():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# --- 7. مسار اختبار إرسال الإشعار الفوري (Test Notification Endpoint) ---
+# --- 7. مسار اختبار الإشعار (اختياري للتأكد من وصول الإشعارات لهاتفك) ---
 @app.route("/api/test-notification", methods=["GET"])
 def test_notification():
     success = send_high_impact_notification(
-        title="Test Forex Breaking News",
-        title_ar="خبر عاجل تجريبي لاختبار النظام",
-        body="هذا إشعار تجريبي للتأكد من عمل النوافذ العائمة والإشعارات بنجاح.",
-        event_data={"country": "USA", "forecast": "3.5%", "previous": "3.2%"},
+        title="Test Forex Real Connection",
+        title_ar="اختبار الاتصال الحقيقي للإشعارات",
+        body="هذا اختبار للتأكد من ربط الهاتف بالسيرفر بنجاح.",
+        event_data={"country": "USA"},
         is_pro_only=False
     )
     if success:
         return jsonify({"status": "success", "message": "Test notification sent successfully!"})
     else:
-        return jsonify({"status": "error", "message": "Failed to send notification. Check server logs."}), 500
+        return jsonify({"status": "error", "message": "Failed to send notification."}), 500
 
-# --- 8. إعدادات الخلاصات ومصادر الأخبار المحدثة ---
+# --- 8. مصادر الأخبار الحقيقية (RSS Feeds) ---
 RSS_FEEDS = {
     "ForexLive": "https://www.forexlive.com/feed/news",
     "FXStreet": "https://www.fxstreet.com/rss/news",
@@ -324,12 +321,13 @@ def fetch_single_feed(source_name, feed_url):
         pass
     return items
 
-# --- 9. تحديث الذاكرة والمزامنة اللحظية مع Firebase ---
+# --- 9. جلب وتحديث البيانات الحقيقية (أخبار + تقويم) ---
 def update_news_cache_job():
     global NEWS_CACHE, NOTIFIED_NEWS_TITLES
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
+    # أ) جلب التقويم الاقتصادي الحقيقي من Forex Factory
     try:
         with httpx.Client(headers=HEADERS, timeout=3.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
@@ -382,6 +380,7 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
+    # ب) جلب الأخبار الحقيقية عبر RSS
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -399,6 +398,7 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
+    # ج) الحفظ في قاعدة البيانات الحقيقية (Firestore)
     if db and all_news:
         try:
             batch = db.batch()
@@ -412,18 +412,18 @@ def update_news_cache_job():
     if all_news:
         NEWS_CACHE["data"] = all_news
         NEWS_CACHE["last_updated"] = time.time()
-        print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(all_news)} articles processed.")
+        print(f"⚡ [{datetime.datetime.now()}] Real Engine Refreshed: {len(all_news)} articles processed.")
 
-# --- 10. المجدول الآلي ---
+# --- 10. المجدول الآلي (تم ضبطه ليجلب البيانات الحقيقية كل دقيقة لضمان الاستقرار وعدم الحظر) ---
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
+scheduler.add_job(func=update_news_cache_job, trigger="interval", minutes=1, max_instances=1)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
 scheduler.start()
 
 update_news_cache_job()
 cleanup_old_news_job()
 
-# --- 11. API Endpoints المحدثة ---
+# --- 11. API Endpoints الحقيقية ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
