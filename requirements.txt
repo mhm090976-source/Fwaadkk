@@ -1,9 +1,11 @@
-fastapi
-uvicorn
-flask
-firebase-admin
+Flask
+flask-cors
 httpx
 feedparser
-flask-cors
+apscheduler
+firebase-admin
+deep-translator
+fastapi
+uvicorn
 APScheduler
 gunicorn
