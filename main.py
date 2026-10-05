@@ -83,13 +83,13 @@ def analyze_market_sentiment(title: str) -> str:
         return "bearish"
     return "neutral"
 
-# --- 4. دالة إرسال الإشعارات الفورية المزودة بتقسيم Pro / Free ---
-def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro_only=False):
+# --- 4. دالة إرسال الإشعارات الفورية (محدثة لتتوافق مع توبيك التطبيق الأساسي) ---
+def send_high_impact_notification(title, title_ar, body, event_data=None):
     """
-    إرسال إشعار فوري FCM مع توجيهه حسب نوع اشتراك المستخدم
+    إرسال إشعار فوري FCM حصرياً لتوبيك الأخبار المهمة (high_impact_news)
     """
     try:
-        topic_target = "pro_users_news" if is_pro_only else "high_impact_news"
+        topic_target = "high_impact_news"
         
         data_payload = {
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
@@ -97,7 +97,7 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
             "show_overlay": "true",
             "title": str(title_ar or title),
             "body": str(body),
-            "is_pro": "true" if is_pro_only else "false"
+            "is_pro": "false"
         }
         
         if event_data:
@@ -218,7 +218,6 @@ def cryptomus_webhook():
         order_id = data.get("order_id", "")
 
         if status in ["paid", "paid_over"]:
-            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
             if db and order_id.startswith("SUB_"):
                 parts = order_id.split("_")
                 if len(parts) >= 2:
@@ -356,8 +355,7 @@ def update_news_cache_job():
                                             "country": str(ev.get('country', '')),
                                             "forecast": str(ev.get('forecast', '')),
                                             "previous": str(ev.get('previous', ''))
-                                        },
-                                        is_pro_only=False
+                                        }
                                     )
                                     NOTIFIED_NEWS_TITLES.add(news_title)
 
@@ -367,22 +365,20 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
+    # ب) جلب RSS بالتوازي (إرسال إشعارات فورية حصرياً للأخبار ذات التأثير العالي)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
             feed_items = future.result()
             for item in feed_items:
                 if item.get("title") not in NOTIFIED_NEWS_TITLES:
-                    is_high = item.get("impact") == "high"
-                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
-                    send_high_impact_notification(
-                        title=item.get("title"),
-                        title_ar=item.get("title_ar"),
-                        body=f"المصدر: {item.get('source')}",
-                        event_data={"link": item.get("link", "")},
-                        is_pro_only=not is_high
-                    )
+                    if item.get("impact") == "high":
+                        send_high_impact_notification(
+                            title=item.get("title"),
+                            title_ar=item.get("title_ar"),
+                            body=f"المصدر: {item.get('source')}",
+                            event_data={"link": item.get("link", "")}
+                        )
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
