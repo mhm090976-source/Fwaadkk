@@ -25,9 +25,10 @@ NEWS_CACHE = {
 
 NOTIFIED_NEWS_TITLES = set()
 
-# --- 2. تهيئة Firebase ---
+# --- 2. تهيئة Firebase المدعومة بمتغيرات البيئة ---
 db = None
 try:
+    # سيقوم Firebase تلقائياً بقراءة GOOGLE_CLOUD_PROJECT من متغيرات البيئة في Render
     firebase_admin.initialize_app()
     db = firestore.client()
     print("✅ Firebase initialized successfully.")
@@ -218,7 +219,6 @@ def cryptomus_webhook():
         order_id = data.get("order_id", "")
 
         if status in ["paid", "paid_over"]:
-            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
             if db and order_id.startswith("SUB_"):
                 parts = order_id.split("_")
                 if len(parts) >= 2:
@@ -314,7 +314,6 @@ def update_news_cache_job():
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
-    # أ) جلب تقويم Forex Factory
     try:
         with httpx.Client(headers=HEADERS, timeout=3.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
@@ -367,7 +366,6 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -375,7 +373,6 @@ def update_news_cache_job():
             for item in feed_items:
                 if item.get("title") not in NOTIFIED_NEWS_TITLES:
                     is_high = item.get("impact") == "high"
-                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
                     send_high_impact_notification(
                         title=item.get("title"),
                         title_ar=item.get("title_ar"),
@@ -386,7 +383,6 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
-    # ج) الحفظ المجمع في Firebase
     if db and all_news:
         try:
             batch = db.batch()
