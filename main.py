@@ -147,7 +147,7 @@ def cleanup_old_news_job():
         print(f"❌ Error during cleanup: {e}")
 
 # --- 6. إعدادات Cryptomus والدفع ---
-CRYPTOMUS_MERCHANT_ID = "b9c7b8dd-cc24-4c13-beef-1f97ae33f932"
+CRYPTOMUS_MERCHANT_ID = "23a84c54-0c08-4feb-b5fc-bcc05a3a218f"
 CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "YOUR_PAYMENT_API_KEY_HERE")
 
 @app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
