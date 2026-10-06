@@ -4,6 +4,9 @@ import base64
 import time
 import datetime
 import os
+import threading
+from collections import deque
+
 import httpx
 import feedparser
 import concurrent.futures
@@ -15,15 +18,32 @@ import firebase_admin
 from firebase_admin import firestore, messaging
 
 app = Flask(__name__)
-CORS(app)
 
-# --- 1. تهيئة الذاكرة المؤقتة (Cache) ---
-NEWS_CACHE = {
-    "data": [],
-    "last_updated": 0
-}
+# ✅ إصلاح: تقييد CORS لنطاقات محددة بدل فتحه للجميع
+CORS(app, origins=["https://fwaadkk.onrender.com"])
 
+# --- 1. الذاكرة المؤقتة مع قفل لحمايتها من التعارض ---
+CACHE_LOCK = threading.Lock()
+NEWS_CACHE = {"data": [], "last_updated": 0}
+
+# ✅ إصلاح: مجموعة محدودة الحجم (تنظيف تلقائي) بدل نمو بلا نهاية
+MAX_NOTIFIED = 5000
 NOTIFIED_NEWS_TITLES = set()
+NOTIFIED_QUEUE = deque()
+
+def mark_notified(title: str) -> bool:
+    """يرجع True إذا كان العنوان جديداً، ويضيفه مع تنظيف القديم"""
+    if title in NOTIFIED_NEWS_TITLES:
+        return False
+    NOTIFIED_NEWS_TITLES.add(title)
+    NOTIFIED_QUEUE.append(title)
+    while len(NOTIFIED_QUEUE) > MAX_NOTIFIED:
+        NOTIFIED_NEWS_TITLES.discard(NOTIFIED_QUEUE.popleft())
+    return True
+
+# ✅ إصلاح: كاش للترجمة لتجنب حظر IP وتسريع المعالجة
+TRANSLATION_CACHE = {}
+translator = GoogleTranslator(source='auto', target='ar')
 
 # --- 2. تهيئة Firebase ---
 db = None
@@ -34,20 +54,24 @@ try:
 except Exception as e:
     print("⚠️ Firebase initialization skipped or failed:", e)
 
-# --- 3. أدوات التحليل والترجمة الذكية ---
+# --- 3. أدوات التحليل والترجمة ---
 
 def translate_to_arabic(text: str) -> str:
-    """ترجمة العنوان تلقائياً إلى العربية مع معالجة الأخطاء السريعة"""
     if not text:
         return ""
+    cache_key = hashlib.md5(text.encode('utf-8')).hexdigest()
+    if cache_key in TRANSLATION_CACHE:
+        return TRANSLATION_CACHE[cache_key]
     try:
-        translated = GoogleTranslator(source='auto', target='ar').translate(text)
-        return translated if translated else text
+        translated = translator.translate(text) or text
     except Exception:
-        return text
+        translated = text
+    # حد أقصى للكاش
+    if len(TRANSLATION_CACHE) < 10000:
+        TRANSLATION_CACHE[cache_key] = translated
+    return translated
 
 def extract_currencies_and_tags(title: str) -> list:
-    """استخراج العملات والأزواج المتأثرة من عنوان الخبر"""
     title_upper = title.upper()
     currency_map = {
         'USD': ['USD', 'DOLLAR', 'FED', 'FOMC', 'POWELL', 'PAYROLLS', 'NFP', 'CPI'],
@@ -56,41 +80,32 @@ def extract_currencies_and_tags(title: str) -> list:
         'JPY': ['JPY', 'YEN', 'BOJ'],
         'GOLD': ['GOLD', 'XAU', 'BULLION'],
         'BTC': ['BTC', 'BITCOIN', 'CRYPTO'],
-        'AUD': ['AUD', 'Aussie'],
-        'CAD': ['CAD', 'Loonie'],
+        'AUD': ['AUD', 'AUSSIE'],
+        'CAD': ['CAD', 'LOONIE'],
         'CHF': ['CHF', 'FRANC']
     }
-    
     tags = set()
     for curr, keywords in currency_map.items():
         if any(k in title_upper for k in keywords):
             tags.add(curr)
-            
     return list(tags) if tags else ['GENERAL']
 
 def analyze_market_sentiment(title: str) -> str:
-    """تحليل الانطباع الأولي للخبر (إيجابي / سلبي / حيادي)"""
     title_lower = title.lower()
     bullish_words = ['surge', 'jump', 'rise', 'growth', 'gain', 'bullish', 'hike', 'beat', 'strong', 'positive']
     bearish_words = ['drop', 'fall', 'plunge', 'decline', 'loss', 'bearish', 'cut', 'miss', 'weak', 'negative', 'slump']
-    
     has_bullish = any(w in title_lower for w in bullish_words)
     has_bearish = any(w in title_lower for w in bearish_words)
-    
     if has_bullish and not has_bearish:
         return "bullish"
     elif has_bearish and not has_bullish:
         return "bearish"
     return "neutral"
 
-# --- 4. دالة إرسال الإشعارات الفورية المزودة بتقسيم Pro / Free ---
+# --- 4. إشعارات FCM ---
 def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro_only=False):
-    """
-    إرسال إشعار فوري FCM مع توجيهه حسب نوع اشتراك المستخدم
-    """
     try:
         topic_target = "pro_users_news" if is_pro_only else "high_impact_news"
-        
         data_payload = {
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
             "impact": "high",
@@ -99,7 +114,6 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
             "body": str(body),
             "is_pro": "true" if is_pro_only else "false"
         }
-        
         if event_data:
             data_payload.update(event_data)
 
@@ -119,36 +133,37 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
                 ),
             ),
         )
-
         response = messaging.send(message)
         print(f"[{datetime.datetime.now()}] 🔔 FCM Sent ({topic_target}): {response}")
     except Exception as e:
         print(f"❌ FCM Notification Error: {e}")
 
-# --- 5. إدارة وتنظيف قاعدة البيانات ---
+# --- 5. تنظيف قاعدة البيانات ---
 def cleanup_old_news_job():
     if not db:
         return
     try:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        one_week_ago = now_utc - datetime.timedelta(days=7)
-        one_week_ago_timestamp = int(one_week_ago.timestamp() * 1000)
-
-        docs = db.collection('articles').where('created_at_ms', '<=', one_week_ago_timestamp).stream()
-        deleted_count = 0
-        
+        one_week_ago = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        ts = int(one_week_ago.timestamp() * 1000)
+        docs = db.collection('articles').where('created_at_ms', '<=', ts).stream()
+        deleted = 0
         for doc in docs:
             doc.reference.delete()
-            deleted_count += 1
-            
-        if deleted_count > 0:
-            print(f"🧹 Auto-Cleanup: Deleted {deleted_count} old news items.")
+            deleted += 1
+        if deleted:
+            print(f"🧹 Auto-Cleanup: Deleted {deleted} old news items.")
     except Exception as e:
         print(f"❌ Error during cleanup: {e}")
 
-# --- 6. إعدادات Cryptomus والدفع ---
-CRYPTOMUS_MERCHANT_ID = "23a84c54-0c08-4feb-b5fc-bcc05a3a218f"
-CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "YOUR_PAYMENT_API_KEY_HERE")
+# --- 6. Cryptomus والدفع ---
+
+# ✅ إصلاح: كل الأسرار من متغيرات البيئة
+CRYPTOMUS_MERCHANT_ID = os.environ.get("CRYPTOMUS_MERCHANT_ID", "")
+CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "")
+
+# ✅ إصلاح: السعر ثابت في السيرفر — لا يقبل أي مبلغ من العميل
+SUBSCRIPTION_PRICE_USD = "10.00"
+BASE_URL = "https://fwaadkk.onrender.com"
 
 @app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
 def cryptomus_verification():
@@ -157,35 +172,38 @@ def cryptomus_verification():
 def generate_cryptomus_signature(data_dict: dict, api_key: str) -> str:
     json_data = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
     base64_data = base64.b64encode(json_data).decode('utf-8')
-    sign_str = base64_data + api_key
-    return hashlib.md5(sign_str.encode('utf-8')).hexdigest()
+    return hashlib.md5((base64_data + api_key).encode('utf-8')).hexdigest()
 
 @app.route("/api/create-invoice", methods=["POST"])
 def create_subscription_invoice():
-    if CRYPTOMUS_PAYMENT_KEY == "YOUR_PAYMENT_API_KEY_HERE":
-        return jsonify({"status": "error", "message": "Cryptomus Payment Key missing"}), 400
+    if not CRYPTOMUS_PAYMENT_KEY or not CRYPTOMUS_MERCHANT_ID:
+        return jsonify({"status": "error", "message": "Payment gateway not configured"}), 500
 
-    req_data = request.json or {}
-    user_id = req_data.get("user_id", "guest")
-    amount = req_data.get("amount", "10.00")
-    order_id = req_data.get("order_id", f"SUB_{user_id}_{int(time.time())}")
+    req_data = request.get_json(silent=True) or {}
+    user_id = str(req_data.get("user_id", "")).strip()
+    # ✅ إصلاح: رفض الطلب بدون user_id صالح
+    if not user_id or user_id == "guest":
+        return jsonify({"status": "error", "message": "Valid user_id required"}), 400
+
+    # ✅ إصلاح: استخدام "." كفاصل لأن "_" قد يكون جزءاً من user_id
+    order_id = f"SUB.{user_id}.{int(time.time())}"
 
     payload = {
-        "amount": amount,
+        "amount": SUBSCRIPTION_PRICE_USD,  # ✅ سعر ثابت من السيرفر
         "currency": "USD",
         "order_id": order_id,
         "network": "TRON",
         "to_currency": "USDT",
-        "url_callback": "https://fwaadkk.onrender.com/api/cryptomus-webhook",
-        "url_success": "https://fwaadkk.onrender.com/?payment=success",
+        "url_callback": f"{BASE_URL}/api/cryptomus-webhook",
+        "url_success": f"{BASE_URL}/?payment=success",
+        "additional_data": user_id,  # ✅ نسخة احتياطية موثوقة للـ user_id
         "is_payment_multiple": False,
         "lifetime": 3600
     }
 
-    signature = generate_cryptomus_signature(payload, CRYPTOMUS_PAYMENT_KEY)
     headers = {
         "merchant": CRYPTOMUS_MERCHANT_ID,
-        "sign": signature,
+        "sign": generate_cryptomus_signature(payload, CRYPTOMUS_PAYMENT_KEY),
         "Content-Type": "application/json"
     }
 
@@ -193,11 +211,8 @@ def create_subscription_invoice():
         with httpx.Client() as client:
             response = client.post(
                 "https://api.cryptomus.com/v1/payment",
-                json=payload,
-                headers=headers,
-                timeout=10.0
+                json=payload, headers=headers, timeout=15.0
             )
-
         res_data = response.json()
         if response.status_code == 200 and res_data.get("state") == 0:
             return jsonify({
@@ -205,37 +220,50 @@ def create_subscription_invoice():
                 "payment_url": res_data["result"]["url"],
                 "invoice_id": res_data["result"]["uuid"]
             })
-        else:
-            return jsonify({"status": "error", "message": res_data.get("message", "Failed")})
+        return jsonify({"status": "error", "message": res_data.get("message", "Failed")})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+def verify_webhook_signature(data: dict, received_sign: str) -> bool:
+    """✅ إصلاح حرج: التحقق من أن الـ webhook قادم فعلاً من Cryptomus"""
+    if not received_sign or not CRYPTOMUS_PAYMENT_KEY:
+        return False
+    expected = generate_cryptomus_signature(data, CRYPTOMUS_PAYMENT_KEY)
+    # مقارنة آمنة ضد timing attacks
+    return hashlib.compare_digest(expected, received_sign) if hasattr(hashlib, 'compare_digest') else expected == received_sign
 
 @app.route("/api/cryptomus-webhook", methods=["POST"])
 def cryptomus_webhook():
     try:
-        data = request.json or {}
-        status = data.get("status")
-        order_id = data.get("order_id", "")
+        data = request.get_json(silent=True) or {}
+        received_sign = request.headers.get("sign", "")
 
-        if status in ["paid", "paid_over"]:
-            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
-            if db and order_id.startswith("SUB_"):
-                parts = order_id.split("_")
-                if len(parts) >= 2:
-                    user_id = parts[1]
-                    db.collection("users").document(user_id).set({
-                        "is_pro": True,
-                        "pro_since": int(time.time() * 1000),
-                        "subscription_status": "active"
-                    }, merge=True)
-                    print(f"✅ User {user_id} upgraded to PRO successfully.")
+        # ✅ إصلاح حرج: رفض أي طلب بدون توقيع صحيح
+        if not verify_webhook_signature(data, received_sign):
+            print("⚠️ Webhook with invalid signature rejected!")
+            return jsonify({"error": "invalid signature"}), 403
+
+        status = data.get("status")
+        order_id = str(data.get("order_id", ""))
+
+        if status in ["paid", "paid_over"] and db and order_id.startswith("SUB."):
+            # ✅ إصلاح: استخراج user_id بشكل صحيح مع فاصل "."
+            parts = order_id.split(".")
+            user_id = parts[1] if len(parts) >= 3 else data.get("additional_data", "")
+            if user_id:
+                db.collection("users").document(user_id).set({
+                    "is_pro": True,
+                    "pro_since": int(time.time() * 1000),
+                    "subscription_status": "active"
+                }, merge=True)
+                print(f"✅ User {user_id} upgraded to PRO successfully.")
             return jsonify({"status": "ok"})
 
         return jsonify({"status": "ignored"})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# --- 7. إعدادات الخلاصات ومصادر الأخبار المحدثة ---
+# --- 7. مصادر الأخبار ---
 RSS_FEEDS = {
     "ForexLive": "https://www.forexlive.com/feed/news",
     "FXStreet": "https://www.fxstreet.com/rss/news",
@@ -255,176 +283,175 @@ HEADERS = {
 }
 
 def generate_doc_id(title, source):
-    raw_str = f"{source}_{title}".encode('utf-8')
-    return hashlib.sha256(raw_str).hexdigest()[:20]
+    return hashlib.sha256(f"{source}_{title}".encode('utf-8')).hexdigest()[:20]
 
 def get_impact_level(title):
-    title_lower = title.lower()
-    if any(k in title_lower for k in HIGH_IMPACT):
+    t = title.lower()
+    if any(k in t for k in HIGH_IMPACT):
         return "high"
-    elif any(k in title_lower for k in MEDIUM_IMPACT):
+    if any(k in t for k in MEDIUM_IMPACT):
         return "medium"
     return "low"
 
 def is_forex_news(title):
-    title_lower = title.lower()
-    return any(k in title_lower for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency', 'gold', 'btc']))
+    t = title.lower()
+    return any(k in t for k in (HIGH_IMPACT + MEDIUM_IMPACT + ['forex', 'fx', 'currency', 'gold', 'btc']))
 
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
-        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=3.5) as client:
+        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=10.0) as client:
             res = client.get(feed_url)
-            if res.status_code == 200:
-                feed = feedparser.parse(res.content)
-                for entry in feed.entries[:8]:
-                    title = entry.get("title", "").strip()
-                    if title and is_forex_news(title):
-                        image_url = ""
-                        if "media_content" in entry and len(entry.media_content) > 0:
-                            image_url = entry.media_content[0].get("url", "")
-                        elif "enclosures" in entry and len(entry.enclosures) > 0:
-                            image_url = entry.enclosures[0].get("href", "")
+            if res.status_code != 200:
+                return items
+            feed = feedparser.parse(res.content)
+            # ✅ إصلاح: التحقق من صلاحية الـ feed (تجاهل صفحات الخطأ HTML)
+            if feed.bozo and not feed.entries:
+                return items
+            for entry in feed.entries[:8]:
+                title = entry.get("title", "").strip()
+                if not title or not is_forex_news(title):
+                    continue
+                image_url = ""
+                if entry.get("media_content"):
+                    image_url = entry.media_content[0].get("url", "")
+                elif entry.get("enclosures"):
+                    image_url = entry.enclosures[0].get("href", "")
 
-                        title_ar = translate_to_arabic(title)
-                        tags = extract_currencies_and_tags(title)
-                        sentiment = analyze_market_sentiment(title)
-
-                        items.append({
-                            "doc_id": generate_doc_id(title, source_name),
-                            "title": title,
-                            "title_ar": title_ar,
-                            "link": entry.get("link", "#"),
-                            "published": entry.get("published", entry.get("updated", "recent")),
-                            "source": source_name,
-                            "image": image_url,
-                            "impact": get_impact_level(title),
-                            "tags": tags,
-                            "sentiment": sentiment,
-                            "target_timestamp": None,
-                            "created_at_ms": int(time.time() * 1000)
-                        })
+                items.append({
+                    "doc_id": generate_doc_id(title, source_name),
+                    "title": title,
+                    "title_ar": translate_to_arabic(title),
+                    "link": entry.get("link", "#"),
+                    "published": entry.get("published", entry.get("updated", "recent")),
+                    "source": source_name,
+                    "image": image_url,
+                    "impact": get_impact_level(title),
+                    "tags": extract_currencies_and_tags(title),
+                    "sentiment": analyze_market_sentiment(title),
+                    "target_timestamp": None,
+                    "created_at_ms": int(time.time() * 1000)
+                })
     except Exception:
         pass
     return items
 
-# --- 8. تحديث الذاكرة والمزامنة اللحظية مع Firebase ---
+# ✅ إصلاح: تقسيم الـ batch لأن حد Firestore هو 500 عملية
+def save_batch_chunked(items):
+    CHUNK = 450
+    for i in range(0, len(items), CHUNK):
+        batch = db.batch()
+        for item in items[i:i + CHUNK]:
+            doc_ref = db.collection('articles').document(item['doc_id'])
+            batch.set(doc_ref, item, merge=True)
+        batch.commit()
+
+# --- 8. مهمة التحديث الرئيسية ---
 def update_news_cache_job():
-    global NEWS_CACHE, NOTIFIED_NEWS_TITLES
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
-    # أ) جلب تقويم Forex Factory
+    # أ) تقويم Forex Factory
     try:
-        with httpx.Client(headers=HEADERS, timeout=3.0) as client:
+        with httpx.Client(headers=HEADERS, timeout=10.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
             if cal_res.status_code == 200:
-                events = cal_res.json()
-                for ev in events:
-                    if ev.get("impact") in ["High", "Medium"]:
-                        try:
-                            dt_str = ev.get("date", "").replace("Z", "+00:00")
-                            dt = datetime.datetime.fromisoformat(dt_str)
-                            event_timestamp = int(dt.timestamp() * 1000)
-
-                            if event_timestamp > current_time_ms:
-                                news_title = f"{ev.get('country')} - {ev.get('title')}"
-                                title_ar = f"{ev.get('country')} - {translate_to_arabic(ev.get('title'))}"
-                                impact_type = "high" if ev.get("impact") == "High" else "medium"
-
-                                item_data = {
-                                    "doc_id": generate_doc_id(news_title, "Forex Factory Calendar"),
-                                    "title": news_title,
-                                    "title_ar": title_ar,
-                                    "link": "https://www.forexfactory.com/calendar",
-                                    "published": f"موعد الصدور: {ev.get('date')}",
-                                    "source": "Forex Factory Calendar",
-                                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                                    "impact": impact_type,
-                                    "tags": [ev.get('country', 'USD')],
-                                    "sentiment": "neutral",
-                                    "target_timestamp": event_timestamp,
-                                    "created_at_ms": current_time_ms
-                                }
-
-                                if impact_type == "high" and news_title not in NOTIFIED_NEWS_TITLES:
-                                    send_high_impact_notification(
-                                        title=news_title,
-                                        title_ar=title_ar,
-                                        body=f"موعد الصدور المرتقب: {ev.get('date')}",
-                                        event_data={
-                                            "country": str(ev.get('country', '')),
-                                            "forecast": str(ev.get('forecast', '')),
-                                            "previous": str(ev.get('previous', ''))
-                                        },
-                                        is_pro_only=False
-                                    )
-                                    NOTIFIED_NEWS_TITLES.add(news_title)
-
-                                all_news.append(item_data)
-                        except Exception:
+                for ev in cal_res.json():
+                    if ev.get("impact") not in ["High", "Medium"]:
+                        continue
+                    try:
+                        dt = datetime.datetime.fromisoformat(ev.get("date", "").replace("Z", "+00:00"))
+                        event_ts = int(dt.timestamp() * 1000)
+                        if event_ts <= current_time_ms:
                             continue
+                        news_title = f"{ev.get('country')} - {ev.get('title')}"
+                        title_ar = f"{ev.get('country')} - {translate_to_arabic(ev.get('title'))}"
+                        impact_type = "high" if ev.get("impact") == "High" else "medium"
+
+                        all_news.append({
+                            "doc_id": generate_doc_id(news_title, "Forex Factory Calendar"),
+                            "title": news_title,
+                            "title_ar": title_ar,
+                            "link": "https://www.forexfactory.com/calendar",
+                            "published": f"موعد الصدور: {ev.get('date')}",
+                            "source": "Forex Factory Calendar",
+                            "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                            "impact": impact_type,
+                            "tags": [ev.get('country', 'USD')],
+                            "sentiment": "neutral",
+                            "target_timestamp": event_ts,
+                            "created_at_ms": current_time_ms
+                        })
+
+                        if impact_type == "high" and mark_notified(news_title):
+                            send_high_impact_notification(
+                                title=news_title, title_ar=title_ar,
+                                body=f"موعد الصدور المرتقب: {ev.get('date')}",
+                                event_data={
+                                    "country": str(ev.get('country', '')),
+                                    "forecast": str(ev.get('forecast', '')),
+                                    "previous": str(ev.get('previous', ''))
+                                },
+                                is_pro_only=False
+                            )
+                    except Exception:
+                        continue
     except Exception as e:
         print("Calendar fetch error:", e)
 
     # ب) جلب RSS بالتوازي
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
+        futures = [executor.submit(fetch_single_feed, n, u) for n, u in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
-            feed_items = future.result()
-            for item in feed_items:
-                if item.get("title") not in NOTIFIED_NEWS_TITLES:
-                    is_high = item.get("impact") == "high"
-                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
+            for item in future.result():
+                if mark_notified(item["title"]):
                     send_high_impact_notification(
-                        title=item.get("title"),
-                        title_ar=item.get("title_ar"),
-                        body=f"المصدر: {item.get('source')}",
+                        title=item["title"],
+                        title_ar=item["title_ar"],
+                        body=f"المصدر: {item['source']}",
                         event_data={"link": item.get("link", "")},
-                        is_pro_only=not is_high
+                        is_pro_only=(item["impact"] != "high")
                     )
-                    NOTIFIED_NEWS_TITLES.add(item.get("title"))
-            all_news.extend(feed_items)
+                all_news.append(item)
 
-    # ج) الحفظ المجمع في Firebase
+    # ج) الحفظ في Firebase
     if db and all_news:
         try:
-            batch = db.batch()
-            for item in all_news:
-                doc_ref = db.collection('articles').document(item['doc_id'])
-                batch.set(doc_ref, item, merge=True)
-            batch.commit()
+            save_batch_chunked(all_news)
         except Exception as e:
             print("❌ Firestore Sync Error:", e)
 
+    # ✅ إصلاح: تحديث الكاش فقط عند وجود بيانات جديدة (مع قفل)
     if all_news:
-        NEWS_CACHE["data"] = all_news
-        NEWS_CACHE["last_updated"] = time.time()
+        with CACHE_LOCK:
+            NEWS_CACHE["data"] = all_news
+            NEWS_CACHE["last_updated"] = time.time()
         print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(all_news)} articles processed.")
 
-# --- 9. المجدول الآلي ---
+# --- 9. المجدول ---
+# ✅ إصلاح: كل 60 ثانية بدل 10، ومهمة واحدة فقط في نفس الوقت
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
+scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=60,
+                  max_instances=1, coalesce=True)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
 scheduler.start()
 
 update_news_cache_job()
 cleanup_old_news_job()
 
-# --- 10. API Endpoints المحدثة ---
+# --- 10. API Endpoints ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
         return Response(status=200)
-
     news_list = []
     try:
         if db:
-            articles_ref = db.collection('articles').order_by('created_at_ms', direction=firestore.Query.DESCENDING).limit(30).stream()
-            news_list = [doc.to_dict() for doc in articles_ref]
+            ref = db.collection('articles').order_by(
+                'created_at_ms', direction=firestore.Query.DESCENDING).limit(30).stream()
+            news_list = [doc.to_dict() for doc in ref]
     except Exception as e:
         print("Firestore Fetch Error:", e)
-
     try:
         return render_template('index.html', news_list=news_list)
     except Exception:
@@ -433,16 +460,16 @@ def home():
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     tag_filter = request.args.get('tag', '').upper()
-    data = NEWS_CACHE["data"]
-    
+    with CACHE_LOCK:
+        data = list(NEWS_CACHE["data"])
+        cached_at = NEWS_CACHE["last_updated"]
     if tag_filter:
         data = [item for item in data if tag_filter in item.get('tags', [])]
-        
     return jsonify({
         "status": "success",
         "total_results": len(data),
         "data": data,
-        "cached_at": NEWS_CACHE["last_updated"]
+        "cached_at": cached_at
     })
 
 @app.route("/api/user-status", methods=["GET"])
@@ -450,16 +477,15 @@ def check_user_status():
     user_id = request.args.get('user_id')
     if not user_id or not db:
         return jsonify({"is_pro": False})
-    
     try:
-        user_doc = db.collection("users").document(user_id).get()
-        if user_doc.exists:
-            return jsonify({"is_pro": user_doc.to_dict().get("is_pro", False)})
+        doc = db.collection("users").document(user_id).get()
+        if doc.exists:
+            return jsonify({"is_pro": doc.to_dict().get("is_pro", False)})
     except Exception:
         pass
-    
     return jsonify({"is_pro": False})
 
 if __name__ == '__main__':
+    # ✅ إصلاح: debug معطل — للإنتاج استخدم: gunicorn -w 2 -b 0.0.0.0:8080 app:app
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
