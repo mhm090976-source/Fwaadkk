@@ -55,15 +55,8 @@ except Exception as e:
     print("⚠️ Firebase initialization failed:", e)
 
 # ============================================================
-# 2. الذاكرة المؤقتة
+# 2. إدارة معرفات الأخبار (منع التكرار)
 # ============================================================
-CACHE_LOCK = threading.Lock()
-NEWS_CACHE = {"data": [], "last_updated": 0}
-CACHE_MAX_ITEMS = 300
-CACHE_MAX_AGE_MS = 24 * 3600 * 1000
-
-# معرّفات الأخبار المعروفة (محفوظة سابقاً في Firestore) — تُحمَّل عند التشغيل
-# حتى لا تتكرر الإشعارات والكتابات بعد إعادة التشغيل.
 MAX_KNOWN = 5000
 KNOWN_IDS = set()
 KNOWN_QUEUE = deque()
@@ -262,7 +255,6 @@ def cryptomus_sign(raw_body: str, api_key: str) -> str:
 
 
 def verify_webhook(data: dict, header_sign: str) -> bool:
-    """التوقيع يأتي داخل الجسم (sign)، ويُحسب على الجسم بدونه مع \\/ بدل /"""
     if not CRYPTOMUS_PAYMENT_KEY:
         return False
     data = dict(data)
@@ -274,9 +266,7 @@ def verify_webhook(data: dict, header_sign: str) -> bool:
     return hmac.compare_digest(expected, str(received))
 
 
-# --- مصادقة المستخدم ---
 def get_request_uid(claimed_uid: str):
-    """يرجع uid الموثوق. يفضّل Firebase ID Token من ترويسة Authorization."""
     header = request.headers.get("Authorization", "")
     if header.startswith("Bearer "):
         if not FIREBASE_READY:
@@ -290,7 +280,6 @@ def get_request_uid(claimed_uid: str):
     return claimed_uid or None
 
 
-# --- تحديد المعدل (بسيط، في الذاكرة) ---
 _RATE = {}
 _RATE_LOCK = threading.Lock()
 
@@ -343,7 +332,6 @@ def create_subscription_invoice():
         "lifetime": 3600,
     }
 
-    # نوقّع النص نفسه الذي نرسله حرفياً
     raw_body = json.dumps(payload, separators=(",", ":"))
     headers = {
         "merchant": CRYPTOMUS_MERCHANT_ID,
@@ -378,7 +366,7 @@ def _activate_pro(transaction, ref, order_id):
     snap = ref.get(transaction=transaction)
     cur = snap.to_dict() if snap.exists else {}
     if cur.get("last_order_id") == order_id:
-        return False  # تمت معالجة هذا الـ webhook سابقاً
+        return False
     now_ms = int(time.time() * 1000)
     base = max(now_ms, int(cur.get("pro_until") or 0))
     update = {
@@ -533,7 +521,6 @@ def fetch_calendar(current_time_ms):
                         continue
                     news_title = f"{ev.get('country')} - {ev.get('title')}"
                     items.append({
-                        # الوقت داخل المعرّف: الحدث المتكرر أسبوعياً يُعتبر جديداً
                         "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
                         "title": news_title,
                         "title_ar": f"{ev.get('country')} - {translate_to_arabic(ev.get('title'))}",
@@ -557,33 +544,8 @@ def fetch_calendar(current_time_ms):
     return items
 
 
-def merge_into_cache(fresh_items):
-    """يدمج الجديد مع القديم بدل الاستبدال، ويحافظ على created_at_ms الأصلي."""
-    now_ms = int(time.time() * 1000)
-    with CACHE_LOCK:
-        merged = {it["doc_id"]: it for it in NEWS_CACHE["data"]}
-        for it in fresh_items:
-            old = merged.get(it["doc_id"])
-            if old:
-                it = dict(it)
-                it["created_at_ms"] = old.get("created_at_ms", it["created_at_ms"])
-            merged[it["doc_id"]] = it
-        kept = []
-        for it in merged.values():
-            ts = it.get("target_timestamp")
-            if ts and ts <= now_ms:
-                continue
-            if not ts and now_ms - it.get("created_at_ms", now_ms) > CACHE_MAX_AGE_MS:
-                continue
-            kept.append(it)
-        kept.sort(key=lambda x: x.get("created_at_ms", 0), reverse=True)
-        NEWS_CACHE["data"] = kept[:CACHE_MAX_ITEMS]
-        NEWS_CACHE["last_updated"] = time.time()
-        return len(NEWS_CACHE["data"])
-
-
 # ============================================================
-# 8. مهمة التحديث الرئيسية
+# 8. مهمة التحديث الرئيسية (مباشرة إلى Firestore)
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -609,7 +571,7 @@ def update_news_cache_job():
 
     new_items = [it for it in candidates.values() if not is_known(it["doc_id"])]
 
-    # حفظ الجديد فقط في Firestore (بدون الحقول المؤقتة)
+    # حفظ الجديد في Firestore مباشرة
     saved_ok = True
     if db and new_items:
         try:
@@ -619,7 +581,7 @@ def update_news_cache_job():
             saved_ok = False
             print("❌ Firestore Sync Error:", e)
 
-    # الإشعارات للجديد فقط
+    # إرسال الإشعارات للجديد فقط
     if saved_ok:
         suppress = _first_cycle and _suppress_first_notify
         for it in new_items:
@@ -646,14 +608,12 @@ def update_news_cache_job():
                     is_pro_only=(it["impact"] != "high"),
                 )
 
-    public_items = [{k: v for k, v in it.items() if not k.startswith("_")} for it in candidates.values()]
-    total = merge_into_cache(public_items)
     _first_cycle = False
-    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new, {total} in cache.")
+    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved to Firestore.")
 
 
 # ============================================================
-# 9. المجدول (عملية واحدة فقط حتى مع عدة workers)
+# 9. المجدول
 # ============================================================
 _LOCK_FH = None
 
@@ -664,7 +624,7 @@ def acquire_scheduler_lock() -> bool:
         import fcntl
         fh = open("/tmp/forex_scheduler.lock", "w")
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _LOCK_FH = fh  # نبقيه مفتوحاً طوال عمر العملية
+        _LOCK_FH = fh
         return True
     except ImportError:
         return True
@@ -675,7 +635,6 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    # next_run_time=now: التشغيل الأول في خيط المجدول، فلا يعطّل بدء الخادم
     scheduler.add_job(update_news_cache_job, "interval", seconds=60,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
@@ -686,11 +645,11 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
 
 
 # ============================================================
-# 10. API Endpoints
+# 10. API Endpoints (القراءة مباشرة من Firestore)
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "firebase": FIREBASE_READY, "cached": len(NEWS_CACHE["data"])})
+    return jsonify({"ok": True, "firebase": FIREBASE_READY, "storage": "firestore"})
 
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -718,13 +677,11 @@ def home():
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     tag_filter = request.args.get("tag", "").upper()
-    with CACHE_LOCK:
-        data = list(NEWS_CACHE["data"])
-        cached_at = NEWS_CACHE["last_updated"]
-
-    # في العمال الذين لا يشغّلون المجدول يكون الكاش فارغاً: نقرأ من Firestore
-    if not data and db:
+    data = []
+    
+    if db:
         try:
+            # جلب آخر الأخبار مباشرة من قاعدة البيانات بحد أقصى 100 عنصر لتقليل الضغط
             ref = (
                 db.collection("articles")
                 .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
@@ -733,15 +690,16 @@ def get_forex_news():
             )
             data = [d.to_dict() for d in ref]
         except Exception as e:
-            print("Firestore fallback error:", e)
+            print("Firestore news fetch error:", e)
 
     if tag_filter:
         data = [item for item in data if tag_filter in item.get("tags", [])]
+
     return jsonify({
         "status": "success",
         "total_results": len(data),
         "data": data,
-        "cached_at": cached_at,
+        "checked_at": int(time.time() * 1000),
     })
 
 
@@ -756,7 +714,6 @@ def check_user_status():
             d = doc.to_dict()
             is_pro = bool(d.get("is_pro", False))
             until = d.get("pro_until")
-            # مشتركون قدامى بدون pro_until يبقون PRO؛ الجدد ينتهي اشتراكهم فعلاً
             if is_pro and until and int(until) < int(time.time() * 1000):
                 is_pro = False
             return jsonify({"is_pro": is_pro, "pro_until": until})
