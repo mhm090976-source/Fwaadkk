@@ -25,19 +25,24 @@ NEWS_CACHE = {
 
 NOTIFIED_NEWS_TITLES = set()
 
-# --- 2. تهيئة Firebase باستخدام متغيرات البيئة (Environment Variables) ---
+# --- 2. تهيئة Firebase مع معالجة آمنة لمتغيرات البيئة ---
 db = None
 try:
     firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
     
     if firebase_creds_json:
-        creds_dict = json.loads(firebase_creds_json)
+        try:
+            creds_dict = json.loads(firebase_creds_json)
+        except json.JSONDecodeError:
+            fixed_json = firebase_creds_json.replace("\\n", "\n")
+            creds_dict = json.loads(fixed_json)
+            
         cred = firebase_admin.credentials.Certificate(creds_dict)
         firebase_admin.initialize_app(cred)
         print("✅ Firebase initialized successfully from Environment Variables.")
     else:
         firebase_admin.initialize_app()
-        print("⚠️ Firebase initialized using default credentials.")
+        print("⚠️ Firebase initialized using default method.")
         
     db = firestore.client()
 except Exception as e:
@@ -410,8 +415,12 @@ def update_news_cache_job():
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
+scheduler.start()
 
-# --- 10. API Endpoints ---
+update_news_cache_job()
+cleanup_old_news_job()
+
+# --- 10. API Endpoints المحدثة ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
@@ -461,6 +470,5 @@ def check_user_status():
     return jsonify({"is_pro": False})
 
 if __name__ == '__main__':
-    scheduler.start()
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
