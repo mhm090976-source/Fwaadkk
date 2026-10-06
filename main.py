@@ -214,7 +214,7 @@ def cleanup_old_news_job():
 # ============================================================
 @app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
 def cryptomus_verification():
-    return Response("cryptomus=b9c7b8dd", mimetype="text/plain")
+    return Response("cryptomus=23a84c54", mimetype="text/plain")
 
 
 def cryptomus_sign(raw_body: str, api_key: str) -> str:
