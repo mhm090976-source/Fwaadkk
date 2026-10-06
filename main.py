@@ -28,9 +28,8 @@ CORS(app, origins=["https://fwaadkk.onrender.com"])
 # ============================================================
 CRYPTOMUS_MERCHANT_ID = os.environ.get("CRYPTOMUS_MERCHANT_ID", "")
 CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "")
-FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")  # محتوى ملف JSON كاملاً
+FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")
 
-# "1" = يرفض أي طلب بدون Firebase ID Token. اتركه "0" حتى يرسل تطبيقك التوكن.
 REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "0") == "1"
 
 SUBSCRIPTION_PRICE_USD = "10.00"
@@ -57,7 +56,7 @@ except Exception as e:
 # ============================================================
 # 2. إدارة معرفات الأخبار (منع التكرار)
 # ============================================================
-MAX_KNOWN = 5000
+MAX_KNOWN = 2000  # تقليل الحجم لتوفير الذاكرة
 KNOWN_IDS = set()
 KNOWN_QUEUE = deque()
 _preloaded = False
@@ -79,7 +78,6 @@ def remember(doc_id: str):
 
 
 def ensure_preloaded():
-    """يحمّل معرّفات آخر المقالات من Firestore مرة واحدة."""
     global _preloaded, _suppress_first_notify
     if _preloaded:
         return
@@ -91,7 +89,7 @@ def ensure_preloaded():
         docs = (
             db.collection("articles")
             .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
-            .limit(2000)
+            .limit(500)  # جلب عدد أقل لتوفير استهلاك الذاكرة عند البدء
             .select([])
             .stream()
         )
@@ -99,7 +97,6 @@ def ensure_preloaded():
             remember(d.id)
     except Exception as e:
         print("⚠️ Preload known ids failed:", e)
-    # قاعدة بيانات فارغة => أول دورة لا ترسل إشعارات (تجنباً لإغراق المستخدمين)
     _suppress_first_notify = len(KNOWN_IDS) == 0
 
 
@@ -126,14 +123,14 @@ def translate_to_arabic(text: str) -> str:
     try:
         translated = get_translator().translate(text) or text
     except Exception:
-        return text  # لا نخزن الفشل في الكاش
-    if len(TRANSLATION_CACHE) < 10000:
+        return text
+    # تقليص حجم الكاش المحلي لمنع تسريب الذاكرة
+    if len(TRANSLATION_CACHE) < 2000:
         TRANSLATION_CACHE[key] = translated
     return translated
 
 
 def build_pattern(words, suffix=False):
-    """مطابقة بحدود الكلمات حتى لا تطابق 'aud' كلمة 'audience'."""
     parts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
     tail = r"(?:s|es|d|ed|ing)?" if suffix else ""
     return re.compile(rf"\b(?:{parts}){tail}\b", re.IGNORECASE)
@@ -209,7 +206,6 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
             ),
         )
         response = messaging.send(message)
-        print(f"[{datetime.datetime.now()}] 🔔 FCM Sent ({topic_target}): {response}")
     except Exception as e:
         print(f"❌ FCM Notification Error: {e}")
 
@@ -221,12 +217,12 @@ def cleanup_old_news_job():
     if not db:
         return
     try:
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)  # تقليص الحفظ لـ 3 أيام لتخفيف حجم قاعدة البيانات
         ts = int(cutoff.timestamp() * 1000)
         deleted = 0
         while True:
             docs = list(
-                db.collection("articles").where("created_at_ms", "<=", ts).limit(450).stream()
+                db.collection("articles").where("created_at_ms", "<=", ts).limit(200).stream()
             )
             if not docs:
                 break
@@ -293,7 +289,7 @@ def rate_limited(key: str, limit: int = 5, window: int = 60) -> bool:
             return True
         hits.append(now)
         _RATE[key] = hits
-        if len(_RATE) > 5000:
+        if len(_RATE) > 1000:
             for k in [k for k, v in _RATE.items() if not v or now - v[-1] > window]:
                 _RATE.pop(k, None)
     return False
@@ -354,7 +350,6 @@ def create_subscription_invoice():
                 "payment_url": res_data["result"]["url"],
                 "invoice_id": res_data["result"]["uuid"],
             })
-        print("⚠️ Cryptomus invoice error:", res_data)
         return jsonify({"status": "error", "message": "Failed to create invoice"}), 502
     except Exception as e:
         print("❌ create-invoice exception:", e)
@@ -386,7 +381,6 @@ def cryptomus_webhook():
     try:
         data = request.get_json(silent=True) or {}
         if not verify_webhook(data, request.headers.get("sign", "")):
-            print("⚠️ Webhook with invalid signature rejected!")
             return jsonify({"error": "invalid signature"}), 403
 
         status = data.get("status")
@@ -398,9 +392,7 @@ def cryptomus_webhook():
             user_id = user_id or str(data.get("additional_data", ""))
             if user_id:
                 ref = db.collection("users").document(user_id)
-                changed = _activate_pro(db.transaction(), ref, order_id)
-                if changed:
-                    print(f"✅ User {user_id} upgraded to PRO.")
+                _activate_pro(db.transaction(), ref, order_id)
             return jsonify({"status": "ok"})
 
         return jsonify({"status": "ignored"})
@@ -433,7 +425,7 @@ MEDIUM_RE = build_pattern(MEDIUM_WORDS, suffix=True)
 FOREX_RE = build_pattern(HIGH_WORDS + MEDIUM_WORDS + EXTRA_WORDS, suffix=True)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
@@ -457,16 +449,15 @@ def is_forex_news(title):
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
-        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=10.0) as client:
+        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=8.0) as client:
             res = client.get(feed_url)
             if res.status_code != 200:
-                print(f"⚠️ Feed {source_name} returned {res.status_code}")
                 return items
             feed = feedparser.parse(res.content)
             if feed.bozo and not feed.entries:
-                print(f"⚠️ Feed {source_name} invalid/empty")
                 return items
-            for entry in feed.entries[:8]:
+            # تخفيض عدد المقالات لكل مصدر إلى 4 لتوفير الذاكرة تماماً
+            for entry in feed.entries[:4]:
                 title = entry.get("title", "").strip()
                 if not title or not is_forex_news(title):
                     continue
@@ -491,12 +482,12 @@ def fetch_single_feed(source_name, feed_url):
                     "created_at_ms": int(time.time() * 1000),
                 })
     except Exception as e:
-        print(f"⚠️ Feed {source_name} error: {e}")
+        print(f"⚠️️ Feed {source_name} error: {e}")
     return items
 
 
 def save_batch_chunked(items):
-    CHUNK = 450
+    CHUNK = 200
     for i in range(0, len(items), CHUNK):
         batch = db.batch()
         for item in items[i:i + CHUNK]:
@@ -507,7 +498,7 @@ def save_batch_chunked(items):
 def fetch_calendar(current_time_ms):
     items = []
     try:
-        with httpx.Client(headers=HEADERS, timeout=10.0) as client:
+        with httpx.Client(headers=HEADERS, timeout=8.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
             if cal_res.status_code != 200:
                 return items
@@ -545,7 +536,7 @@ def fetch_calendar(current_time_ms):
 
 
 # ============================================================
-# 8. مهمة التحديث الرئيسية (مباشرة إلى Firestore)
+# 8. مهمة التحديث الرئيسية (توفير الذاكرة عبر خيوط أقل max_workers=3)
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -557,7 +548,8 @@ def update_news_cache_job():
     for item in fetch_calendar(current_time_ms):
         candidates[item["doc_id"]] = item
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    # تقليل عدد العمليات المتوازية لمنع استهلاك الذاكرة العشوائية (RAM)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(fetch_single_feed, n, u) for n, u in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -571,7 +563,6 @@ def update_news_cache_job():
 
     new_items = [it for it in candidates.values() if not is_known(it["doc_id"])]
 
-    # حفظ الجديد في Firestore مباشرة
     saved_ok = True
     if db and new_items:
         try:
@@ -581,7 +572,6 @@ def update_news_cache_job():
             saved_ok = False
             print("❌ Firestore Sync Error:", e)
 
-    # إرسال الإشعارات للجديد فقط
     if saved_ok:
         suppress = _first_cycle and _suppress_first_notify
         for it in new_items:
@@ -609,7 +599,7 @@ def update_news_cache_job():
                 )
 
     _first_cycle = False
-    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved to Firestore.")
+    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved.")
 
 
 # ============================================================
@@ -645,7 +635,7 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
 
 
 # ============================================================
-# 10. API Endpoints (القراءة مباشرة من Firestore)
+# 10. API Endpoints
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
@@ -662,7 +652,7 @@ def home():
             ref = (
                 db.collection("articles")
                 .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
-                .limit(30)
+                .limit(20)
                 .stream()
             )
             news_list = [doc.to_dict() for doc in ref]
@@ -681,11 +671,11 @@ def get_forex_news():
     
     if db:
         try:
-            # جلب آخر الأخبار مباشرة من قاعدة البيانات بحد أقصى 100 عنصر لتقليل الضغط
+            # تقليص الحد الأقصى للمقالات المسترجعة إلى 40 لتخفيف استهلاك الذاكرة تماماً
             ref = (
                 db.collection("articles")
                 .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
-                .limit(100)
+                .limit(40)
                 .stream()
             )
             data = [d.to_dict() for d in ref]
