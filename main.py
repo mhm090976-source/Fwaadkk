@@ -25,7 +25,7 @@ NEWS_CACHE = {
 
 NOTIFIED_NEWS_TITLES = set()
 
-# --- 2. تهيئة Firebase مع معالجة آمنة لمتغيرات البيئة ---
+# --- 2. تهيئة Firebase بشكل آمن ومنع خطأ التطبيق الافتراضي ---
 db = None
 try:
     firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
@@ -38,10 +38,12 @@ try:
             creds_dict = json.loads(fixed_json)
             
         cred = firebase_admin.credentials.Certificate(creds_dict)
-        firebase_admin.initialize_app(cred)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
         print("✅ Firebase initialized successfully from Environment Variables.")
     else:
-        firebase_admin.initialize_app()
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
         print("⚠️ Firebase initialized using default method.")
         
     db = firestore.client()
