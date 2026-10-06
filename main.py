@@ -212,7 +212,7 @@ def cleanup_old_news_job():
 # ============================================================
 # 6. Cryptomus والدفع
 # ============================================================
-@app.route("/cryptomus_b9c7b8dd.html", methods=["GET"])
+@app.route("/cryptomus_23a84c54.html", methods=["GET"])
 def cryptomus_verification():
     return Response("cryptomus=23a84c54", mimetype="text/plain")
 
