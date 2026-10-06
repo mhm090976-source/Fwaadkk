@@ -25,30 +25,14 @@ NEWS_CACHE = {
 
 NOTIFIED_NEWS_TITLES = set()
 
-# --- 2. تهيئة Firebase بشكل آمن ومنع خطأ التطبيق الافتراضي ---
+# --- 2. تهيئة Firebase ---
 db = None
 try:
-    firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
-    
-    if firebase_creds_json:
-        try:
-            creds_dict = json.loads(firebase_creds_json)
-        except json.JSONDecodeError:
-            fixed_json = firebase_creds_json.replace("\\n", "\n")
-            creds_dict = json.loads(fixed_json)
-            
-        cred = firebase_admin.credentials.Certificate(creds_dict)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        print("✅ Firebase initialized successfully from Environment Variables.")
-    else:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
-        print("⚠️ Firebase initialized using default method.")
-        
+    firebase_admin.initialize_app()
     db = firestore.client()
+    print("✅ Firebase initialized successfully.")
 except Exception as e:
-    print("⚠️ Firebase initialization failed:", e)
+    print("⚠️ Firebase initialization skipped or failed:", e)
 
 # --- 3. أدوات التحليل والترجمة الذكية ---
 
@@ -234,6 +218,7 @@ def cryptomus_webhook():
         order_id = data.get("order_id", "")
 
         if status in ["paid", "paid_over"]:
+            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
             if db and order_id.startswith("SUB_"):
                 parts = order_id.split("_")
                 if len(parts) >= 2:
@@ -329,6 +314,7 @@ def update_news_cache_job():
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
+    # أ) جلب تقويم Forex Factory
     try:
         with httpx.Client(headers=HEADERS, timeout=3.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
@@ -381,6 +367,7 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
+    # ب) جلب RSS بالتوازي
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -388,6 +375,7 @@ def update_news_cache_job():
             for item in feed_items:
                 if item.get("title") not in NOTIFIED_NEWS_TITLES:
                     is_high = item.get("impact") == "high"
+                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
                     send_high_impact_notification(
                         title=item.get("title"),
                         title_ar=item.get("title_ar"),
@@ -398,6 +386,7 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
+    # ج) الحفظ المجمع في Firebase
     if db and all_news:
         try:
             batch = db.batch()
