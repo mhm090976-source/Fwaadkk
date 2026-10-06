@@ -14,7 +14,6 @@ import feedparser
 import firebase_admin
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
-from deep_translator import GoogleTranslator
 from firebase_admin import auth as fb_auth
 from firebase_admin import credentials, firestore, messaging
 from flask import Flask, Response, jsonify, render_template, request
@@ -101,35 +100,8 @@ def ensure_preloaded():
 
 
 # ============================================================
-# 3. الترجمة والتحليل
+# 3. التحليل
 # ============================================================
-TRANSLATION_CACHE = {}
-_tl = threading.local()
-
-
-def get_translator():
-    if not hasattr(_tl, "t"):
-        _tl.t = GoogleTranslator(source="auto", target="ar")
-    return _tl.t
-
-
-def translate_to_arabic(text: str) -> str:
-    if not text:
-        return ""
-    key = hashlib.md5(text.encode("utf-8")).hexdigest()
-    cached = TRANSLATION_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        translated = get_translator().translate(text) or text
-    except Exception:
-        return text
-    # تقليص حجم الكاش المحلي لمنع تسريب الذاكرة
-    if len(TRANSLATION_CACHE) < 2000:
-        TRANSLATION_CACHE[key] = translated
-    return translated
-
-
 def build_pattern(words, suffix=False):
     parts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
     tail = r"(?:s|es|d|ed|ing)?" if suffix else ""
@@ -176,7 +148,7 @@ def analyze_market_sentiment(title: str) -> str:
 # ============================================================
 # 4. إشعارات FCM
 # ============================================================
-def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro_only=False):
+def send_high_impact_notification(title, body, event_data=None, is_pro_only=False):
     if not FIREBASE_READY:
         return
     try:
@@ -185,7 +157,7 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
             "impact": "high",
             "show_overlay": "true",
-            "title": str(title_ar or title),
+            "title": str(title),
             "body": str(body),
             "is_pro": "true" if is_pro_only else "false",
         }
@@ -193,7 +165,7 @@ def send_high_impact_notification(title, title_ar, body, event_data=None, is_pro
             data_payload.update({k: str(v) for k, v in event_data.items()})
 
         message = messaging.Message(
-            notification=messaging.Notification(title=f"🚨 {title_ar or title}", body=body),
+            notification=messaging.Notification(title=f"🚨 {title}", body=body),
             data=data_payload,
             topic=topic_target,
             android=messaging.AndroidConfig(
@@ -456,7 +428,6 @@ def fetch_single_feed(source_name, feed_url):
             feed = feedparser.parse(res.content)
             if feed.bozo and not feed.entries:
                 return items
-            # تخفيض عدد المقالات لكل مصدر إلى 4 لتوفير الذاكرة تماماً
             for entry in feed.entries[:4]:
                 title = entry.get("title", "").strip()
                 if not title or not is_forex_news(title):
@@ -470,7 +441,6 @@ def fetch_single_feed(source_name, feed_url):
                 items.append({
                     "doc_id": generate_doc_id(title, source_name),
                     "title": title,
-                    "title_ar": translate_to_arabic(title),
                     "link": entry.get("link", "#"),
                     "published": entry.get("published", entry.get("updated", "recent")),
                     "source": source_name,
@@ -482,7 +452,7 @@ def fetch_single_feed(source_name, feed_url):
                     "created_at_ms": int(time.time() * 1000),
                 })
     except Exception as e:
-        print(f"⚠️️ Feed {source_name} error: {e}")
+        print(f"⚠ Feed {source_name} error: {e}")
     return items
 
 
@@ -514,7 +484,6 @@ def fetch_calendar(current_time_ms):
                     items.append({
                         "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
                         "title": news_title,
-                        "title_ar": f"{ev.get('country')} - {translate_to_arabic(ev.get('title'))}",
                         "link": "https://www.forexfactory.com/calendar",
                         "published": f"موعد الصدور: {ev.get('date')}",
                         "source": "Forex Factory Calendar",
@@ -536,7 +505,7 @@ def fetch_calendar(current_time_ms):
 
 
 # ============================================================
-# 8. مهمة التحديث الرئيسية (توفير الذاكرة عبر خيوط أقل max_workers=3)
+# 8. مهمة التحديث الرئيسية
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -548,7 +517,6 @@ def update_news_cache_job():
     for item in fetch_calendar(current_time_ms):
         candidates[item["doc_id"]] = item
 
-    # تقليل عدد العمليات المتوازية لمنع استهلاك الذاكرة العشوائية (RAM)
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(fetch_single_feed, n, u) for n, u in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -581,7 +549,7 @@ def update_news_cache_job():
             if it["source"] == "Forex Factory Calendar":
                 if it["impact"] == "high":
                     send_high_impact_notification(
-                        title=it["title"], title_ar=it["title_ar"],
+                        title=it["title"],
                         body=f"موعد الصدور المرتقب: {it['_date']}",
                         event_data={
                             "country": it["tags"][0] if it["tags"] else "",
@@ -592,7 +560,7 @@ def update_news_cache_job():
                     )
             else:
                 send_high_impact_notification(
-                    title=it["title"], title_ar=it["title_ar"],
+                    title=it["title"],
                     body=f"المصدر: {it['source']}",
                     event_data={"link": it.get("link", "")},
                     is_pro_only=(it["impact"] != "high"),
@@ -603,7 +571,7 @@ def update_news_cache_job():
 
 
 # ============================================================
-# 9. المجدول
+# 9. المجدول (تم التعديل إلى 10 ثوانٍ)
 # ============================================================
 _LOCK_FH = None
 
@@ -625,13 +593,14 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(update_news_cache_job, "interval", seconds=60,
+    # تحديث الأخبار كل 10 ثوانٍ
+    scheduler.add_job(update_news_cache_job, "interval", seconds=10,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
     scheduler.add_job(cleanup_old_news_job, "interval", days=1, max_instances=1,
                       next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2))
     scheduler.start()
-    print("⏱️ Scheduler started in this process.")
+    print("⏱️ Scheduler started in this process (Every 10 seconds).")
 
 
 # ============================================================
@@ -671,7 +640,6 @@ def get_forex_news():
     
     if db:
         try:
-            # تقليص الحد الأقصى للمقالات المسترجعة إلى 40 لتخفيف استهلاك الذاكرة تماماً
             ref = (
                 db.collection("articles")
                 .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
