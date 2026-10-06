@@ -218,7 +218,6 @@ def cryptomus_webhook():
         order_id = data.get("order_id", "")
 
         if status in ["paid", "paid_over"]:
-            # تفعيل اشتراك المستخدم في Firestore عند تأكيد الدفع
             if db and order_id.startswith("SUB_"):
                 parts = order_id.split("_")
                 if len(parts) >= 2:
@@ -314,7 +313,6 @@ def update_news_cache_job():
     all_news = []
     current_time_ms = int(time.time() * 1000)
 
-    # أ) جلب تقويم Forex Factory
     try:
         with httpx.Client(headers=HEADERS, timeout=3.0) as client:
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
@@ -367,7 +365,6 @@ def update_news_cache_job():
     except Exception as e:
         print("Calendar fetch error:", e)
 
-    # ب) جلب RSS بالتوازي
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(fetch_single_feed, name, url) for name, url in RSS_FEEDS.items()]
         for future in concurrent.futures.as_completed(futures):
@@ -375,7 +372,6 @@ def update_news_cache_job():
             for item in feed_items:
                 if item.get("title") not in NOTIFIED_NEWS_TITLES:
                     is_high = item.get("impact") == "high"
-                    # إرسال الأخبار العالية للجميع والأقل خطورة للمشتركين فقط
                     send_high_impact_notification(
                         title=item.get("title"),
                         title_ar=item.get("title_ar"),
@@ -386,7 +382,6 @@ def update_news_cache_job():
                     NOTIFIED_NEWS_TITLES.add(item.get("title"))
             all_news.extend(feed_items)
 
-    # ج) الحفظ المجمع في Firebase
     if db and all_news:
         try:
             batch = db.batch()
@@ -402,16 +397,12 @@ def update_news_cache_job():
         NEWS_CACHE["last_updated"] = time.time()
         print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(all_news)} articles processed.")
 
-# --- 9. المجدول الآلي ---
+# --- 9. إعداد المجدول الآلي (بدون تشغيل فوري معطل) ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
-scheduler.start()
 
-update_news_cache_job()
-cleanup_old_news_job()
-
-# --- 10. API Endpoints المحدثة ---
+# --- 10. API Endpoints ---
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     if request.method == "HEAD":
@@ -461,5 +452,8 @@ def check_user_status():
     return jsonify({"is_pro": False})
 
 if __name__ == '__main__':
+    # تشغيل المجدول هنا بأمان بعد إقلاع السيرفر
+    scheduler.start()
+    
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
