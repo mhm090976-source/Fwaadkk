@@ -25,14 +25,23 @@ NEWS_CACHE = {
 
 NOTIFIED_NEWS_TITLES = set()
 
-# --- 2. تهيئة Firebase ---
+# --- 2. تهيئة Firebase باستخدام متغيرات البيئة (Environment Variables) ---
 db = None
 try:
-    firebase_admin.initialize_app()
+    firebase_creds_json = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+    
+    if firebase_creds_json:
+        creds_dict = json.loads(firebase_creds_json)
+        cred = firebase_admin.credentials.Certificate(creds_dict)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase initialized successfully from Environment Variables.")
+    else:
+        firebase_admin.initialize_app()
+        print("⚠️ Firebase initialized using default credentials.")
+        
     db = firestore.client()
-    print("✅ Firebase initialized successfully.")
 except Exception as e:
-    print("⚠️ Firebase initialization skipped or failed:", e)
+    print("⚠️ Firebase initialization failed:", e)
 
 # --- 3. أدوات التحليل والترجمة الذكية ---
 
@@ -397,7 +406,7 @@ def update_news_cache_job():
         NEWS_CACHE["last_updated"] = time.time()
         print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(all_news)} articles processed.")
 
-# --- 9. إعداد المجدول الآلي (بدون تشغيل فوري معطل) ---
+# --- 9. المجدول الآلي ---
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=update_news_cache_job, trigger="interval", seconds=10, max_instances=3)
 scheduler.add_job(func=cleanup_old_news_job, trigger="interval", days=1, max_instances=1)
@@ -452,8 +461,6 @@ def check_user_status():
     return jsonify({"is_pro": False})
 
 if __name__ == '__main__':
-    # تشغيل المجدول هنا بأمان بعد إقلاع السيرفر
     scheduler.start()
-    
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
