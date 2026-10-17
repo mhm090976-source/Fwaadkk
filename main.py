@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from collections import deque
+from email.utils import parsedate_to_datetime
 
 import feedparser
 import firebase_admin
@@ -53,9 +54,9 @@ except Exception as e:
     print("⚠️ Firebase initialization failed:", e)
 
 # ============================================================
-# 2. إدارة معرفات الأخبار (منع التكرار)
+# 2. إدارة معرفات الأخبار وسجل الإشعارات المستقر في قاعدة البيانات
 # ============================================================
-MAX_KNOWN = 2000  # تقليل الحجم لتوفير الذاكرة
+MAX_KNOWN = 2000
 KNOWN_IDS = set()
 KNOWN_QUEUE = deque()
 _preloaded = False
@@ -88,7 +89,7 @@ def ensure_preloaded():
         docs = (
             db.collection("articles")
             .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
-            .limit(500)  # جلب عدد أقل لتوفير استهلاك الذاكرة عند البدء
+            .limit(500)
             .select([])
             .stream()
         )
@@ -99,8 +100,30 @@ def ensure_preloaded():
     _suppress_first_notify = len(KNOWN_IDS) == 0
 
 
+# التحقق من سجل الإشعارات المرسلة عبر قاعدة البيانات لمنع التكرار حتى بعد إعادة تشغيل السيرفر
+def was_notification_sent(notification_key: str) -> bool:
+    if not db:
+        return False
+    try:
+        doc = db.collection("sent_notifications").document(notification_key).get()
+        return doc.exists
+    except Exception:
+        return False
+
+
+def mark_notification_sent(notification_key: str):
+    if not db:
+        return
+    try:
+        db.collection("sent_notifications").document(notification_key).set({
+            "sent_at_ms": int(time.time() * 1000)
+        })
+    except Exception as e:
+        print(f"⚠️ Error marking notification sent: {e}")
+
+
 # ============================================================
-# 3. التحليل
+# 3. التحليل المتقدم وتحويل التوقيتات بدقة (UTC Epoch)
 # ============================================================
 def build_pattern(words, suffix=False):
     parts = "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
@@ -145,6 +168,26 @@ def analyze_market_sentiment(title: str) -> str:
     return "neutral"
 
 
+# تحويل توقيت أي موقع بدقة إلى توقيت عالمي موحد (UTC Timestamp بالمللي ثانية)
+def parse_entry_timestamp(entry) -> int:
+    try:
+        if hasattr(entry, "published_parsed") and entry.published_parsed:
+            dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
+            return int(dt.timestamp() * 1000)
+        
+        pub_str = entry.get("published", entry.get("updated", ""))
+        if pub_str:
+            dt = parsedate_to_datetime(pub_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                dt = dt.astimezone(datetime.timezone.utc)
+            return int(dt.timestamp() * 1000)
+    except Exception:
+        pass
+    return int(time.time() * 1000)
+
+
 # ============================================================
 # 4. إشعارات FCM
 # ============================================================
@@ -177,7 +220,7 @@ def send_high_impact_notification(title, body, event_data=None, is_pro_only=Fals
                 ),
             ),
         )
-        response = messaging.send(message)
+        messaging.send(message)
     except Exception as e:
         print(f"❌ FCM Notification Error: {e}")
 
@@ -189,7 +232,7 @@ def cleanup_old_news_job():
     if not db:
         return
     try:
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)  # تقليص الحفظ لـ 3 أيام لتخفيف حجم قاعدة البيانات
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)
         ts = int(cutoff.timestamp() * 1000)
         deleted = 0
         while True:
@@ -210,7 +253,51 @@ def cleanup_old_news_job():
 
 
 # ============================================================
-# 6. Cryptomus والدفع
+# 6. مهمة فحص التقويم قبل 5 دقائق بدقة من جهة السيرفر
+# ============================================================
+def check_calendar_5min_job():
+    if not db:
+        return
+    try:
+        now_ms = int(time.time() * 1000)
+        # نافذة زمنية دقيقة بين 4:30 و 5:30 دقائق قبل الحدث
+        lower_limit = now_ms + 270 * 1000
+        upper_limit = now_ms + 330 * 1000
+        docs = (
+            db.collection("articles")
+            .where("target_timestamp", ">=", lower_limit)
+            .where("target_timestamp", "<=", upper_limit)
+            .stream()
+        )
+        for doc in docs:
+            d = doc.to_dict()
+            doc_id = doc.id
+            notif_key = f"cal_5min_{doc_id}"
+            
+            if was_notification_sent(notif_key):
+                continue
+                
+            if d.get("source") == "Forex Factory Calendar":
+                mark_notification_sent(notif_key)
+                title = d.get("title", "")
+                send_high_impact_notification(
+                    title="⏳ تذكير التقويم الاقتصادي",
+                    body=f"يتبقى 5 دقائق على صدور الحدث: {title}",
+                    event_data={
+                        "show_overlay": "true",
+                        "type": "calendar_5min",
+                        "title": title,
+                        "body": f"يتبقى 5 دقائق على صدور الحدث: {title}",
+                    },
+                    is_pro_only=False,
+                )
+                print(f"⏰ Server sent 5-min calendar alert for: {title}")
+    except Exception as e:
+        print(f"❌ Calendar 5min check error: {e}")
+
+
+# ============================================================
+# 7. Cryptomus والدفع
 # ============================================================
 @app.route("/cryptomus_23a84c54.html", methods=["GET"])
 def cryptomus_verification():
@@ -374,7 +461,7 @@ def cryptomus_webhook():
 
 
 # ============================================================
-# 7. مصادر الأخبار
+# 8. مصادر الأخبار
 # ============================================================
 RSS_FEEDS = {
     "ForexLive": "https://www.forexlive.com/feed/news",
@@ -386,6 +473,7 @@ RSS_FEEDS = {
     "Yahoo Finance Currency": "https://finance.yahoo.com/news/rssindex",
 }
 
+# كلمات مفتاحية دقيقة لتقليل الإنذارات الكاذبة
 HIGH_WORDS = ["fed", "federal reserve", "interest rate", "cpi", "nfp", "powell", "inflation",
               "ecb", "central bank", "fomc", "gdp"]
 MEDIUM_WORDS = ["dollar", "euro", "pound", "yen", "usd", "eur", "gbp", "jpy", "trade", "retail",
@@ -418,6 +506,7 @@ def is_forex_news(title):
     return bool(FOREX_RE.search(title))
 
 
+# جلب وفحص كل مصدر بمعزل تام (Robust Isolation) لضمان عدم توقف السيرفر لو تعطل موقع واحد
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
@@ -438,6 +527,17 @@ def fetch_single_feed(source_name, feed_url):
                 elif entry.get("enclosures"):
                     image_url = entry.enclosures[0].get("href", "")
 
+                # جلب محتوى أو ملخص الخبر الكامل لنقطة النهاية API
+                content_text = ""
+                if entry.get("content"):
+                    content_text = entry.content[0].get("value", "")
+                elif entry.get("summary"):
+                    content_text = entry.summary
+                elif entry.get("description"):
+                    content_text = entry.description
+
+                pub_ms = parse_entry_timestamp(entry)
+
                 items.append({
                     "doc_id": generate_doc_id(title, source_name),
                     "title": title,
@@ -445,11 +545,12 @@ def fetch_single_feed(source_name, feed_url):
                     "published": entry.get("published", entry.get("updated", "recent")),
                     "source": source_name,
                     "image": image_url,
+                    "content": content_text,
                     "impact": get_impact_level(title),
                     "tags": extract_currencies_and_tags(title),
                     "sentiment": analyze_market_sentiment(title),
                     "target_timestamp": None,
-                    "created_at_ms": int(time.time() * 1000),
+                    "created_at_ms": pub_ms,
                 })
     except Exception as e:
         print(f"⚠ Feed {source_name} error: {e}")
@@ -488,6 +589,7 @@ def fetch_calendar(current_time_ms):
                         "published": f"موعد الصدور: {ev.get('date')}",
                         "source": "Forex Factory Calendar",
                         "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                        "content": f"الحدث الاقتصادي: {news_title} | المتوقع: {ev.get('forecast', 'N/A')} | السابق: {ev.get('previous', 'N/A')}",
                         "impact": "high" if ev.get("impact") == "High" else "medium",
                         "tags": [ev.get("country", "USD")],
                         "sentiment": "neutral",
@@ -505,7 +607,7 @@ def fetch_calendar(current_time_ms):
 
 
 # ============================================================
-# 8. مهمة التحديث الرئيسية
+# 9. مهمة التحديث الرئيسية مع منع التكرار الذكي (Smart Deduplication)
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -518,11 +620,22 @@ def update_news_cache_job():
         candidates[item["doc_id"]] = item
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_single_feed, n, u) for n, u in RSS_FEEDS.items()]
+        futures = {executor.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
         for future in concurrent.futures.as_completed(futures):
             try:
                 for item in future.result():
-                    candidates.setdefault(item["doc_id"], item)
+                    # فلترة ذكية لتجنب تكرار نشر نفس الخبر من مصادر مختلفة في نفس الوقت
+                    title_lower = item["title"].lower()
+                    is_duplicate = False
+                    for existing in candidates.values():
+                        if existing["source"] != "Forex Factory Calendar" and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000:
+                            # مقارنة التشابه البسيط في العناوين
+                            sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
+                            if len(sim_words) >= 4:
+                                is_duplicate = True
+                                break
+                    if not is_duplicate:
+                        candidates.setdefault(item["doc_id"], item)
             except Exception as e:
                 print("⚠️ Feed future error:", e)
 
@@ -548,30 +661,36 @@ def update_news_cache_job():
                 continue
             if it["source"] == "Forex Factory Calendar":
                 if it["impact"] == "high":
+                    notif_key = f"cal_pub_{it['doc_id']}"
+                    if not was_notification_sent(notif_key):
+                        mark_notification_sent(notif_key)
+                        send_high_impact_notification(
+                            title=it["title"],
+                            body=f"موعد الصدور المرتقب: {it['_date']}",
+                            event_data={
+                                "country": it["tags"][0] if it["tags"] else "",
+                                "forecast": it["_forecast"],
+                                "previous": it["_previous"],
+                            },
+                            is_pro_only=False,
+                        )
+            else:
+                notif_key = f"news_{it['doc_id']}"
+                if not was_notification_sent(notif_key):
+                    mark_notification_sent(notif_key)
                     send_high_impact_notification(
                         title=it["title"],
-                        body=f"موعد الصدور المرتقب: {it['_date']}",
-                        event_data={
-                            "country": it["tags"][0] if it["tags"] else "",
-                            "forecast": it["_forecast"],
-                            "previous": it["_previous"],
-                        },
-                        is_pro_only=False,
+                        body=f"المصدر: {it['source']}",
+                        event_data={"link": it.get("link", ""), "doc_id": it["doc_id"]},
+                        is_pro_only=(it["impact"] != "high"),
                     )
-            else:
-                send_high_impact_notification(
-                    title=it["title"],
-                    body=f"المصدر: {it['source']}",
-                    event_data={"link": it.get("link", "")},
-                    is_pro_only=(it["impact"] != "high"),
-                )
 
     _first_cycle = False
     print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved.")
 
 
 # ============================================================
-# 9. المجدول (تم التعديل إلى 10 ثوانٍ)
+# 10. المجدول (10 ثوانٍ للأخبار + دقيقة لفحص التقويم قبل 5 دقائق)
 # ============================================================
 _LOCK_FH = None
 
@@ -593,18 +712,21 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    # تحديث الأخبار كل 10 ثوانٍ
+    # تحديث الأخبار كل 10 ثوانٍ (حسب رغبتك للسرعة)
     scheduler.add_job(update_news_cache_job, "interval", seconds=10,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
+    # فحص أحداث التقويم قبل 5 دقائق كل دقيقة بدقة
+    scheduler.add_job(check_calendar_5min_job, "interval", seconds=60,
+                      max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_old_news_job, "interval", days=1, max_instances=1,
                       next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2))
     scheduler.start()
-    print("⏱️ Scheduler started in this process (Every 10 seconds).")
+    print("⏱️ Scheduler started in this process.")
 
 
 # ============================================================
-# 10. API Endpoints
+# 11. API Endpoints بنيكل موحد وثابت
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
@@ -659,6 +781,24 @@ def get_forex_news():
         "data": data,
         "checked_at": int(time.time() * 1000),
     })
+
+
+# نقطة نهاية API لجلب محتوى الخبر أو المقال الكامل عبر المعرف (doc_id)
+@app.route("/api/article/<doc_id>", methods=["GET"])
+def get_article_detail(doc_id):
+    if not db:
+        return jsonify({"status": "error", "message": "Database not ready"}), 500
+    try:
+        doc = db.collection("articles").document(doc_id).get()
+        if doc.exists:
+            return jsonify({
+                "status": "success",
+                "data": doc.to_dict()
+            })
+        return jsonify({"status": "error", "message": "Article not found"}), 404
+    except Exception as e:
+        print(f"Article detail error: {e}")
+        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 
 @app.route("/api/user-status", methods=["GET"])
