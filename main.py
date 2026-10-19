@@ -100,6 +100,7 @@ def ensure_preloaded():
     _suppress_first_notify = len(KNOWN_IDS) == 0
 
 
+# التحقق من سجل الإشعارات المرسلة عبر قاعدة البيانات لمنع التكرار حتى بعد إعادة تشغيل السيرفر
 def was_notification_sent(notification_key: str) -> bool:
     if not db:
         return False
@@ -167,6 +168,7 @@ def analyze_market_sentiment(title: str) -> str:
     return "neutral"
 
 
+# تحويل توقيت أي موقع بدقة إلى توقيت عالمي موحد (UTC Timestamp بالمللي ثانية)
 def parse_entry_timestamp(entry) -> int:
     try:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -219,34 +221,8 @@ def send_high_impact_notification(title, body, event_data=None, is_pro_only=Fals
             ),
         )
         messaging.send(message)
-        print(f"🚀 FCM Notification sent successfully: {title}")
     except Exception as e:
         print(f"❌ FCM Notification Error: {e}")
-
-
-# ============================================================
-# وظيفة اختبار إرسال نافذة عائمة وهمية كل دقيقة
-# ============================================================
-def send_test_overlay_job():
-    if not FIREBASE_READY:
-        print("⚠️ Firebase not ready for test notification.")
-        return
-    try:
-        test_title = "🚨 اختبار نافذة عائمة وهمية"
-        test_body = f"هذا إشعار تجريبي تم إرساله في تمام الساعة {datetime.datetime.now().strftime('%H:%M:%S')} لاختبار النافذة!"
-        send_high_impact_notification(
-            title=test_title,
-            body=test_body,
-            event_data={
-                "show_overlay": "true",
-                "type": "breaking",
-                "title": test_title,
-                "body": test_body,
-            },
-            is_pro_only=False,
-        )
-    except Exception as e:
-        print(f"❌ Test notification error: {e}")
 
 
 # ============================================================
@@ -284,6 +260,7 @@ def check_calendar_5min_job():
         return
     try:
         now_ms = int(time.time() * 1000)
+        # نافذة زمنية دقيقة بين 4:30 و 5:30 دقائق قبل الحدث
         lower_limit = now_ms + 270 * 1000
         upper_limit = now_ms + 330 * 1000
         docs = (
@@ -314,6 +291,7 @@ def check_calendar_5min_job():
                     },
                     is_pro_only=False,
                 )
+                print(f"⏰ Server sent 5-min calendar alert for: {title}")
     except Exception as e:
         print(f"❌ Calendar 5min check error: {e}")
 
@@ -495,6 +473,7 @@ RSS_FEEDS = {
     "Yahoo Finance Currency": "https://finance.yahoo.com/news/rssindex",
 }
 
+# كلمات مفتاحية دقيقة لتقليل الإنذارات الكاذبة
 HIGH_WORDS = ["fed", "federal reserve", "interest rate", "cpi", "nfp", "powell", "inflation",
               "ecb", "central bank", "fomc", "gdp"]
 MEDIUM_WORDS = ["dollar", "euro", "pound", "yen", "usd", "eur", "gbp", "jpy", "trade", "retail",
@@ -527,6 +506,7 @@ def is_forex_news(title):
     return bool(FOREX_RE.search(title))
 
 
+# جلب وفحص كل مصدر بمعزل تام (Robust Isolation) لضمان عدم توقف السيرفر لو تعطل موقع واحد
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
@@ -547,6 +527,7 @@ def fetch_single_feed(source_name, feed_url):
                 elif entry.get("enclosures"):
                     image_url = entry.enclosures[0].get("href", "")
 
+                # جلب محتوى أو ملخص الخبر الكامل لنقطة النهاية API
                 content_text = ""
                 if entry.get("content"):
                     content_text = entry.content[0].get("value", "")
@@ -626,7 +607,7 @@ def fetch_calendar(current_time_ms):
 
 
 # ============================================================
-# 9. مهمة التحديث الرئيسية
+# 9. مهمة التحديث الرئيسية مع منع التكرار الذكي (Smart Deduplication)
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -643,10 +624,12 @@ def update_news_cache_job():
         for future in concurrent.futures.as_completed(futures):
             try:
                 for item in future.result():
+                    # فلترة ذكية لتجنب تكرار نشر نفس الخبر من مصادر مختلفة في نفس الوقت
                     title_lower = item["title"].lower()
                     is_duplicate = False
                     for existing in candidates.values():
                         if existing["source"] != "Forex Factory Calendar" and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000:
+                            # مقارنة التشابه البسيط في العناوين
                             sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
                             if len(sim_words) >= 4:
                                 is_duplicate = True
@@ -703,10 +686,11 @@ def update_news_cache_job():
                     )
 
     _first_cycle = False
+    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved.")
 
 
 # ============================================================
-# 10. المجدول (تم إضافة مهمة اختبار النافذة العائمة كل دقيقة)
+# 10. المجدول (10 ثوانٍ للأخبار + دقيقة لفحص التقويم قبل 5 دقائق)
 # ============================================================
 _LOCK_FH = None
 
@@ -728,24 +712,21 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
+    # تحديث الأخبار كل 10 ثوانٍ (حسب رغبتك للسرعة)
     scheduler.add_job(update_news_cache_job, "interval", seconds=10,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
+    # فحص أحداث التقويم قبل 5 دقائق كل دقيقة بدقة
     scheduler.add_job(check_calendar_5min_job, "interval", seconds=60,
                       max_instances=1, coalesce=True)
-    
-    # 🧪 مهمة اختبار تجريبية لإرسال نافذة عائمة وهمية كل دقيقة لاختبار الخلفية
-    scheduler.add_job(send_test_overlay_job, "interval", seconds=60,
-                      max_instances=1, coalesce=True)
-    
     scheduler.add_job(cleanup_old_news_job, "interval", days=1, max_instances=1,
                       next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2))
     scheduler.start()
-    print("⏱️ Scheduler started in this process (with Test Overlay Job every 60s).")
+    print("⏱️ Scheduler started in this process.")
 
 
 # ============================================================
-# 11. API Endpoints
+# 11. API Endpoints بنيكل موحد وثابت
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
@@ -802,6 +783,7 @@ def get_forex_news():
     })
 
 
+# نقطة نهاية API لجلب محتوى الخبر أو المقال الكامل عبر المعرف (doc_id)
 @app.route("/api/article/<doc_id>", methods=["GET"])
 def get_article_detail(doc_id):
     if not db:
@@ -837,8 +819,7 @@ def check_user_status():
         print("user-status error:", e)
     return jsonify({"is_pro": False})
 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
