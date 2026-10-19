@@ -837,7 +837,8 @@ def check_user_status():
         print("user-status error:", e)
     return jsonify({"is_pro": False})
 
-
-if `__name__` == "__main__":
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
