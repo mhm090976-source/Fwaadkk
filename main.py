@@ -203,6 +203,7 @@ def send_high_impact_notification(title, body, event_data=None, is_pro_only=Fals
             "title": str(title),
             "body": str(body),
             "is_pro": "true" if is_pro_only else "false",
+            "timestamp": str(int(time.time() * 1000)),  # <-- الطابع الزمني لتزامن النوافذ العائمة ومنع القديمة
         }
         if event_data:
             data_payload.update({k: str(v) for k, v in event_data.items()})
@@ -659,6 +660,13 @@ def update_news_cache_job():
             remember(it["doc_id"])
             if suppress:
                 continue
+            
+            # --- شرط حاسم لمنع إرسال إشعارات لأخبار قديمة ---
+            news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
+            if news_age_ms > 90000:  # إذا مر أكثر من 90 ثانية، يتم حفظ الخبر بصمت دون إزعاج المستخدم بإشعار/نافذة
+                continue
+            # -----------------------------------------------
+
             if it["source"] == "Forex Factory Calendar":
                 if it["impact"] == "high":
                     notif_key = f"cal_pub_{it['doc_id']}"
@@ -690,7 +698,7 @@ def update_news_cache_job():
 
 
 # ============================================================
-# 10. المجدول (10 ثوانٍ للأخبار + دقيقة لفحص التقويم قبل 5 دقائق)
+# 10. المجدول (5 ثوانٍ للأخبار الفائقة السرعة + دقيقة لفحص التقويم قبل 5 دقائق)
 # ============================================================
 _LOCK_FH = None
 
@@ -712,8 +720,8 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    # تحديث الأخبار كل 10 ثوانٍ (حسب رغبتك للسرعة)
-    scheduler.add_job(update_news_cache_job, "interval", seconds=10,
+    # تحديث الأخبار كل 5 ثوانٍ لضمان أقصى سرعة ولحظية في النشر
+    scheduler.add_job(update_news_cache_job, "interval", seconds=5,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
     # فحص أحداث التقويم قبل 5 دقائق كل دقيقة بدقة
