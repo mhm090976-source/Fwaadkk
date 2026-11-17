@@ -620,7 +620,7 @@ def update_news_cache_job():
     for item in fetch_calendar(current_time_ms):
         candidates[item["doc_id"]] = item
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
         futures = {executor.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
         for future in concurrent.futures.as_completed(futures):
             try:
