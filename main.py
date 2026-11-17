@@ -100,7 +100,6 @@ def ensure_preloaded():
     _suppress_first_notify = len(KNOWN_IDS) == 0
 
 
-# التحقق من سجل الإشعارات المرسلة عبر قاعدة البيانات لمنع التكرار حتى بعد إعادة تشغيل السيرفر
 def was_notification_sent(notification_key: str) -> bool:
     if not db:
         return False
@@ -168,7 +167,6 @@ def analyze_market_sentiment(title: str) -> str:
     return "neutral"
 
 
-# تحويل توقيت أي موقع بدقة إلى توقيت عالمي موحد (UTC Timestamp بالمللي ثانية)
 def parse_entry_timestamp(entry) -> int:
     try:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -203,7 +201,7 @@ def send_high_impact_notification(title, body, event_data=None, is_pro_only=Fals
             "title": str(title),
             "body": str(body),
             "is_pro": "true" if is_pro_only else "false",
-            "timestamp": str(int(time.time() * 1000)),  # <-- الطابع الزمني لتزامن النوافذ العائمة ومنع القديمة
+            "timestamp": str(int(time.time() * 1000)),
         }
         if event_data:
             data_payload.update({k: str(v) for k, v in event_data.items()})
@@ -233,7 +231,7 @@ def cleanup_old_news_job():
     if not db:
         return
     try:
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=3)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
         ts = int(cutoff.timestamp() * 1000)
         deleted = 0
         while True:
@@ -254,14 +252,13 @@ def cleanup_old_news_job():
 
 
 # ============================================================
-# 6. مهمة فحص التقويم قبل 5 دقائق بدقة من جهة السيرفر
+# 6. مهمة فحص التقويم قبل 5 دقائق
 # ============================================================
 def check_calendar_5min_job():
     if not db:
         return
     try:
         now_ms = int(time.time() * 1000)
-        # نافذة زمنية دقيقة بين 4:30 و 5:30 دقائق قبل الحدث
         lower_limit = now_ms + 270 * 1000
         upper_limit = now_ms + 330 * 1000
         docs = (
@@ -474,7 +471,6 @@ RSS_FEEDS = {
     "Yahoo Finance Currency": "https://finance.yahoo.com/news/rssindex",
 }
 
-# كلمات مفتاحية دقيقة لتقليل الإنذارات الكاذبة
 HIGH_WORDS = ["fed", "federal reserve", "interest rate", "cpi", "nfp", "powell", "inflation",
               "ecb", "central bank", "fomc", "gdp"]
 MEDIUM_WORDS = ["dollar", "euro", "pound", "yen", "usd", "eur", "gbp", "jpy", "trade", "retail",
@@ -507,7 +503,6 @@ def is_forex_news(title):
     return bool(FOREX_RE.search(title))
 
 
-# جلب وفحص كل مصدر بمعزل تام (Robust Isolation) لضمان عدم توقف السيرفر لو تعطل موقع واحد
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
@@ -528,7 +523,6 @@ def fetch_single_feed(source_name, feed_url):
                 elif entry.get("enclosures"):
                     image_url = entry.enclosures[0].get("href", "")
 
-                # جلب محتوى أو ملخص الخبر الكامل لنقطة النهاية API
                 content_text = ""
                 if entry.get("content"):
                     content_text = entry.content[0].get("value", "")
@@ -538,6 +532,7 @@ def fetch_single_feed(source_name, feed_url):
                     content_text = entry.description
 
                 pub_ms = parse_entry_timestamp(entry)
+                arrival_ms = int(time.time() * 1000)
 
                 items.append({
                     "doc_id": generate_doc_id(title, source_name),
@@ -552,6 +547,7 @@ def fetch_single_feed(source_name, feed_url):
                     "sentiment": analyze_market_sentiment(title),
                     "target_timestamp": None,
                     "created_at_ms": pub_ms,
+                    "server_received_at_ms": arrival_ms,
                 })
     except Exception as e:
         print(f"⚠ Feed {source_name} error: {e}")
@@ -567,6 +563,7 @@ def save_batch_chunked(items):
         batch.commit()
 
 
+# --- دالة جلب التقويم المحدثة لتغطي الأسبوع كاملاً (من السبت إلى الجمعة) مع حفظ حقول الأيام ---
 def fetch_calendar(current_time_ms):
     items = []
     try:
@@ -574,15 +571,33 @@ def fetch_calendar(current_time_ms):
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
             if cal_res.status_code != 200:
                 return items
+            
+            # حساب حدود الأسبوع الحالي (من السبت إلى الجمعة)
+            now_dt = datetime.datetime.now(datetime.timezone.utc)
+            days_since_saturday = (now_dt.weekday() - 5) % 7
+            saturday_start = (now_dt - datetime.timedelta(days=days_since_saturday)).replace(hour=0, minute=0, second=0, microsecond=0)
+            friday_end = saturday_start + datetime.timedelta(days=6, hours=23, minutes=59, seconds=59)
+            
+            saturday_ms = int(saturday_start.timestamp() * 1000)
+            friday_ms = int(friday_end.timestamp() * 1000)
+
             for ev in cal_res.json():
                 if ev.get("impact") not in ("High", "Medium"):
                     continue
                 try:
                     dt = datetime.datetime.fromisoformat(ev.get("date", "").replace("Z", "+00:00"))
                     event_ts = int(dt.timestamp() * 1000)
-                    if event_ts <= current_time_ms:
+                    
+                    # التحقق من أن الحدث يقع ضمن الأسبوع الحالي (من السبت للجمعة)
+                    if not (saturday_ms <= event_ts <= friday_ms):
                         continue
+                        
                     news_title = f"{ev.get('country')} - {ev.get('title')}"
+                    
+                    # استخراج اسم اليوم وتاريخ اليوم بصيغة واضحة للتطبيق
+                    day_name = dt.strftime("%A") # مثل Saturday, Sunday ...
+                    date_str = dt.strftime("%Y-%m-%d") # مثل 2026-06-07
+                    
                     items.append({
                         "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
                         "title": news_title,
@@ -592,10 +607,13 @@ def fetch_calendar(current_time_ms):
                         "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
                         "content": f"الحدث الاقتصادي: {news_title} | المتوقع: {ev.get('forecast', 'N/A')} | السابق: {ev.get('previous', 'N/A')}",
                         "impact": "high" if ev.get("impact") == "High" else "medium",
-                        "tags": [ev.get("country", "USD")],
+                        "tags": [ev.get("country", "USD"), day_name],
                         "sentiment": "neutral",
                         "target_timestamp": event_ts,
                         "created_at_ms": current_time_ms,
+                        "server_received_at_ms": current_time_ms,
+                        "calendar_date": date_str,  # حقل التاريخ الفعلي لتصفية الأيام في التطبيق
+                        "calendar_day": day_name,   # حقل اسم اليوم (Saturday, Sunday, ...)
                         "_forecast": str(ev.get("forecast", "")),
                         "_previous": str(ev.get("previous", "")),
                         "_date": str(ev.get("date", "")),
@@ -608,7 +626,7 @@ def fetch_calendar(current_time_ms):
 
 
 # ============================================================
-# 9. مهمة التحديث الرئيسية مع منع التكرار الذكي (Smart Deduplication)
+# 9. مهمة التحديث الرئيسية مع منع التكرار الذكي
 # ============================================================
 def update_news_cache_job():
     global _first_cycle
@@ -620,17 +638,15 @@ def update_news_cache_job():
     for item in fetch_calendar(current_time_ms):
         candidates[item["doc_id"]] = item
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(RSS_FEEDS)) as executor:
         futures = {executor.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
         for future in concurrent.futures.as_completed(futures):
             try:
                 for item in future.result():
-                    # فلترة ذكية لتجنب تكرار نشر نفس الخبر من مصادر مختلفة في نفس الوقت
                     title_lower = item["title"].lower()
                     is_duplicate = False
                     for existing in candidates.values():
                         if existing["source"] != "Forex Factory Calendar" and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000:
-                            # مقارنة التشابه البسيط في العناوين
                             sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
                             if len(sim_words) >= 4:
                                 is_duplicate = True
@@ -661,11 +677,9 @@ def update_news_cache_job():
             if suppress:
                 continue
             
-            # --- شرط حاسم لمنع إرسال إشعارات لأخبار قديمة ---
             news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
-            if news_age_ms > 90000:  # إذا مر أكثر من 90 ثانية، يتم حفظ الخبر بصمت دون إزعاج المستخدم بإشعار/نافذة
+            if news_age_ms > 90000:
                 continue
-            # -----------------------------------------------
 
             if it["source"] == "Forex Factory Calendar":
                 if it["impact"] == "high":
@@ -698,7 +712,7 @@ def update_news_cache_job():
 
 
 # ============================================================
-# 10. المجدول (5 ثوانٍ للأخبار الفائقة السرعة + دقيقة لفحص التقويم قبل 5 دقائق)
+# 10. المجدول
 # ============================================================
 _LOCK_FH = None
 
@@ -720,11 +734,9 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    # تحديث الأخبار كل 5 ثوانٍ لضمان أقصى سرعة ولحظية في النشر
     scheduler.add_job(update_news_cache_job, "interval", seconds=5,
                       max_instances=1, coalesce=True,
                       next_run_time=datetime.datetime.now())
-    # فحص أحداث التقويم قبل 5 دقائق كل دقيقة بدقة
     scheduler.add_job(check_calendar_5min_job, "interval", seconds=60,
                       max_instances=1, coalesce=True)
     scheduler.add_job(cleanup_old_news_job, "interval", days=1, max_instances=1,
@@ -734,7 +746,7 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
 
 
 # ============================================================
-# 11. API Endpoints بنيكل موحد وثابت
+# 11. API Endpoints
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
@@ -791,7 +803,6 @@ def get_forex_news():
     })
 
 
-# نقطة نهاية API لجلب محتوى الخبر أو المقال الكامل عبر المعرف (doc_id)
 @app.route("/api/article/<doc_id>", methods=["GET"])
 def get_article_detail(doc_id):
     if not db:
