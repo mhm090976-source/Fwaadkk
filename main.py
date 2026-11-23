@@ -299,15 +299,9 @@ def check_calendar_5min_job():
 # ============================================================
 # 7. Cryptomus والدفع
 # ============================================================
-@app.route("/cryptomus_23a84c54.html", methods=["GET"])
-def cryptomus_verification():
-    return Response("cryptomus=23a84c54", mimetype="text/plain")
-
-
 @app.route("/cryptomus_c7fb9c69.html", methods=["GET"])
-def cryptomus_verification_c7fb9c69():
-    return Response("cryptomus=c7fb9c69", mimetype="text/plain")  #
-
+def cryptomus_verification_new():
+    return Response("cryptomus=c7fb9c69", mimetype="text/plain")
 
 def cryptomus_sign(raw_body: str, api_key: str) -> str:
     b64 = base64.b64encode(raw_body.encode("utf-8")).decode("utf-8")
@@ -902,4 +896,10 @@ def check_user_status():
                 is_pro = False
             return jsonify({"is_pro": is_pro, "pro_until": until})
     except Exception as e:
-        print("user
+        print("user-status error:", e)
+    return jsonify({"is_pro": False})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
