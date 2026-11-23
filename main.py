@@ -3,6 +3,7 @@ import concurrent.futures
 import datetime
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -29,6 +30,7 @@ CORS(app, origins=["https://fwaadkk.onrender.com"])
 CRYPTOMUS_MERCHANT_ID = os.environ.get("CRYPTOMUS_MERCHANT_ID", "")
 CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "")
 FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")
+CONTACT_INFO = os.environ.get("CONTACT_INFO", "support@fwaadkk.onrender.com")
 
 REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "0") == "1"
 
@@ -172,7 +174,7 @@ def parse_entry_timestamp(entry) -> int:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             dt = datetime.datetime(*entry.published_parsed[:6], tzinfo=datetime.timezone.utc)
             return int(dt.timestamp() * 1000)
-        
+
         pub_str = entry.get("published", entry.get("updated", ""))
         if pub_str:
             dt = parsedate_to_datetime(pub_str)
@@ -271,10 +273,10 @@ def check_calendar_5min_job():
             d = doc.to_dict()
             doc_id = doc.id
             notif_key = f"cal_5min_{doc_id}"
-            
+
             if was_notification_sent(notif_key):
                 continue
-                
+
             if d.get("source") == "Forex Factory Calendar":
                 mark_notification_sent(notif_key)
                 title = d.get("title", "")
@@ -563,7 +565,6 @@ def save_batch_chunked(items):
         batch.commit()
 
 
-# --- دالة جلب التقويم المحدثة لتغطي الأسبوع كاملاً (من السبت إلى الجمعة) مع حفظ حقول الأيام ---
 def fetch_calendar(current_time_ms):
     items = []
     try:
@@ -571,13 +572,12 @@ def fetch_calendar(current_time_ms):
             cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
             if cal_res.status_code != 200:
                 return items
-            
-            # حساب حدود الأسبوع الحالي (من السبت إلى الجمعة)
+
             now_dt = datetime.datetime.now(datetime.timezone.utc)
             days_since_saturday = (now_dt.weekday() - 5) % 7
             saturday_start = (now_dt - datetime.timedelta(days=days_since_saturday)).replace(hour=0, minute=0, second=0, microsecond=0)
             friday_end = saturday_start + datetime.timedelta(days=6, hours=23, minutes=59, seconds=59)
-            
+
             saturday_ms = int(saturday_start.timestamp() * 1000)
             friday_ms = int(friday_end.timestamp() * 1000)
 
@@ -587,17 +587,14 @@ def fetch_calendar(current_time_ms):
                 try:
                     dt = datetime.datetime.fromisoformat(ev.get("date", "").replace("Z", "+00:00"))
                     event_ts = int(dt.timestamp() * 1000)
-                    
-                    # التحقق من أن الحدث يقع ضمن الأسبوع الحالي (من السبت للجمعة)
+
                     if not (saturday_ms <= event_ts <= friday_ms):
                         continue
-                        
+
                     news_title = f"{ev.get('country')} - {ev.get('title')}"
-                    
-                    # استخراج اسم اليوم وتاريخ اليوم بصيغة واضحة للتطبيق
-                    day_name = dt.strftime("%A") # مثل Saturday, Sunday ...
-                    date_str = dt.strftime("%Y-%m-%d") # مثل 2026-06-07
-                    
+                    day_name = dt.strftime("%A")
+                    date_str = dt.strftime("%Y-%m-%d")
+
                     items.append({
                         "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
                         "title": news_title,
@@ -612,8 +609,8 @@ def fetch_calendar(current_time_ms):
                         "target_timestamp": event_ts,
                         "created_at_ms": current_time_ms,
                         "server_received_at_ms": current_time_ms,
-                        "calendar_date": date_str,  # حقل التاريخ الفعلي لتصفية الأيام في التطبيق
-                        "calendar_day": day_name,   # حقل اسم اليوم (Saturday, Sunday, ...)
+                        "calendar_date": date_str,
+                        "calendar_day": day_name,
                         "_forecast": str(ev.get("forecast", "")),
                         "_previous": str(ev.get("previous", "")),
                         "_date": str(ev.get("date", "")),
@@ -676,7 +673,7 @@ def update_news_cache_job():
             remember(it["doc_id"])
             if suppress:
                 continue
-            
+
             news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
             if news_age_ms > 90000:
                 continue
@@ -748,6 +745,71 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
 # ============================================================
 # 11. API Endpoints
 # ============================================================
+def _build_fallback_html(news_list: list) -> str:
+    safe_contact = html.escape(CONTACT_INFO)
+    safe_price = html.escape(SUBSCRIPTION_PRICE_USD)
+    items_html = ""
+    for item in news_list[:8]:
+        title = html.escape(str(item.get("title", "")))
+        source = html.escape(str(item.get("source", "Forex News live")))
+        published = html.escape(str(item.get("published", "")))
+        if title:
+            items_html += (
+                f"<div class='card'>"
+                f"<div class='meta'>{source} • {published}</div>"
+                f"<div class='title'>{title}</div>"
+                f"</div>"
+            )
+    if not items_html:
+        items_html = (
+            "<div class='card'>"
+            "<div class='title'>Real-time Forex &amp; Economic Calendar Feed</div>"
+            "<div class='meta'>Live market updates and high-impact event alerts</div>"
+            "</div>"
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forex News live — Real-Time Market News &amp; Calendar</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; line-height: 1.6; }}
+    .wrap {{ max-width: 820px; margin: 0 auto; }}
+    .hero {{ background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; margin-bottom: 20px; }}
+    .badge {{ display: inline-block; background: #0284c7; color: #fff; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: bold; }}
+    h1 {{ margin: 12px 0 8px; font-size: 26px; }}
+    .plan {{ background: #172554; border: 1px solid #38bdf8; border-radius: 14px; padding: 18px; margin-bottom: 20px; }}
+    .price {{ font-size: 22px; font-weight: bold; color: #38bdf8; margin: 6px 0; }}
+    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; margin-bottom: 12px; }}
+    .meta {{ color: #94a3b8; font-size: 12px; }}
+    .title {{ font-weight: bold; margin-top: 4px; }}
+    .footer {{ margin-top: 24px; padding-top: 16px; border-top: 1px solid #334155; color: #cbd5e1; font-size: 14px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <span class="badge">LIVE SERVICE</span>
+      <h1>Forex News live</h1>
+      <p>Real-time foreign exchange news aggregator, economic calendar tracker, and high-impact market alerts for traders.</p>
+    </div>
+    <div class="plan">
+      <div><strong>PRO Subscription Plan</strong></div>
+      <div class="price">${safe_price} / {SUBSCRIPTION_DAYS} Days</div>
+      <div>Includes priority market alerts, extended calendar tracking, and subscriber features inside the Forex News live application.</div>
+    </div>
+    <h2>Latest Market Updates</h2>
+    {items_html}
+    <div class="footer">
+      <strong>Contact &amp; Support:</strong> {safe_contact}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "firebase": FIREBASE_READY, "storage": "firestore"})
@@ -772,14 +834,14 @@ def home():
     try:
         return render_template("index.html", news_list=news_list)
     except Exception:
-        return jsonify({"status": "live", "message": "Pro Forex API Engine is running."})
+        return Response(_build_fallback_html(news_list), mimetype="text/html")
 
 
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     tag_filter = request.args.get("tag", "").upper()
     data = []
-    
+
     if db:
         try:
             ref = (
