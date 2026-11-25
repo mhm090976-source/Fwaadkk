@@ -3,7 +3,6 @@ import concurrent.futures
 import datetime
 import hashlib
 import hmac
-import html
 import json
 import os
 import re
@@ -30,7 +29,6 @@ CORS(app, origins=["https://fwaadkk.onrender.com"])
 CRYPTOMUS_MERCHANT_ID = os.environ.get("CRYPTOMUS_MERCHANT_ID", "")
 CRYPTOMUS_PAYMENT_KEY = os.environ.get("CRYPTOMUS_PAYMENT_KEY", "")
 FIREBASE_CREDENTIALS = os.environ.get("FIREBASE_CREDENTIALS", "")
-CONTACT_INFO = os.environ.get("CONTACT_INFO", "support@fwaadkk.onrender.com")
 
 REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "0") == "1"
 
@@ -56,11 +54,21 @@ except Exception as e:
     print("⚠️ Firebase initialization failed:", e)
 
 # ============================================================
-# 2. إدارة معرفات الأخبار وسجل الإشعارات المستقر في قاعدة البيانات
+# 2. إدارة معرفات الأخبار، الذاكرة الساخنة، وسجل الإشعارات السريع
 # ============================================================
 MAX_KNOWN = 2000
 KNOWN_IDS = set()
 KNOWN_QUEUE = deque()
+
+MAX_SENT_NOTIF = 2000
+SENT_NOTIF_CACHE = set()
+SENT_NOTIF_QUEUE = deque()
+
+HOT_NEWS_RAM = deque(maxlen=120)
+_HOT_LOCK = threading.Lock()
+_CALENDAR_CACHE = []
+_CAL_LOCK = threading.Lock()
+
 _preloaded = False
 _first_cycle = True
 _suppress_first_notify = False
@@ -77,6 +85,18 @@ def remember(doc_id: str):
     KNOWN_QUEUE.append(doc_id)
     while len(KNOWN_QUEUE) > MAX_KNOWN:
         KNOWN_IDS.discard(KNOWN_QUEUE.popleft())
+
+
+def push_hot_news(items):
+    if not items:
+        return
+    with _HOT_LOCK:
+        existing_ids = {x.get("doc_id") for x in HOT_NEWS_RAM}
+        for it in items:
+            clean = {k: v for k, v in it.items() if not k.startswith("_")}
+            if clean.get("doc_id") not in existing_ids:
+                HOT_NEWS_RAM.appendleft(clean)
+                existing_ids.add(clean.get("doc_id"))
 
 
 def ensure_preloaded():
@@ -97,30 +117,56 @@ def ensure_preloaded():
         )
         for d in docs:
             remember(d.id)
+
+        hot_docs = (
+            db.collection("articles")
+            .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
+            .limit(80)
+            .stream()
+        )
+        with _HOT_LOCK:
+            HOT_NEWS_RAM.clear()
+            for hd in hot_docs:
+                HOT_NEWS_RAM.append(hd.to_dict())
     except Exception as e:
         print("⚠️ Preload known ids failed:", e)
     _suppress_first_notify = len(KNOWN_IDS) == 0
 
 
 def was_notification_sent(notification_key: str) -> bool:
+    if notification_key in SENT_NOTIF_CACHE:
+        return True
     if not db:
         return False
     try:
         doc = db.collection("sent_notifications").document(notification_key).get()
-        return doc.exists
+        if doc.exists:
+            SENT_NOTIF_CACHE.add(notification_key)
+            SENT_NOTIF_QUEUE.append(notification_key)
+            return True
+        return False
     except Exception:
         return False
 
 
 def mark_notification_sent(notification_key: str):
-    if not db:
-        return
-    try:
-        db.collection("sent_notifications").document(notification_key).set({
-            "sent_at_ms": int(time.time() * 1000)
-        })
-    except Exception as e:
-        print(f"⚠️ Error marking notification sent: {e}")
+    if notification_key not in SENT_NOTIF_CACHE:
+        SENT_NOTIF_CACHE.add(notification_key)
+        SENT_NOTIF_QUEUE.append(notification_key)
+        while len(SENT_NOTIF_QUEUE) > MAX_SENT_NOTIF:
+            SENT_NOTIF_CACHE.discard(SENT_NOTIF_QUEUE.popleft())
+
+    def _write():
+        if not db:
+            return
+        try:
+            db.collection("sent_notifications").document(notification_key).set({
+                "sent_at_ms": int(time.time() * 1000)
+            })
+        except Exception as e:
+            print(f"⚠️ Error marking notification sent: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
 
 
 # ============================================================
@@ -189,7 +235,7 @@ def parse_entry_timestamp(entry) -> int:
 
 
 # ============================================================
-# 4. إشعارات FCM
+# 4. إشعارات FCM الفورية
 # ============================================================
 def send_high_impact_notification(title, body, event_data=None, is_pro_only=False):
     if not FIREBASE_READY:
@@ -299,9 +345,10 @@ def check_calendar_5min_job():
 # ============================================================
 # 7. Cryptomus والدفع
 # ============================================================
-@app.route("/cryptomus_c7fb9c69.html", methods=["GET"])
-def cryptomus_verification_new():
-    return Response("cryptomus=c7fb9c69", mimetype="text/plain")
+@app.route("/cryptomus_23a84c54.html", methods=["GET"])
+def cryptomus_verification():
+    return Response("cryptomus=23a84c54", mimetype="text/plain")
+
 
 def cryptomus_sign(raw_body: str, api_key: str) -> str:
     b64 = base64.b64encode(raw_body.encode("utf-8")).decode("utf-8")
@@ -460,7 +507,7 @@ def cryptomus_webhook():
 
 
 # ============================================================
-# 8. مصادر الأخبار
+# 8. مصادر الأخبار (عميل HTTP مشترك وسريع)
 # ============================================================
 RSS_FEEDS = {
     "ForexLive": "https://www.forexlive.com/feed/news",
@@ -487,6 +534,13 @@ HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
+HTTP_CLIENT = httpx.Client(
+    headers=HEADERS,
+    follow_redirects=True,
+    timeout=3.0,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
 
 def generate_doc_id(title, source):
     return hashlib.sha256(f"{source}_{title}".encode("utf-8")).hexdigest()[:20]
@@ -507,55 +561,56 @@ def is_forex_news(title):
 def fetch_single_feed(source_name, feed_url):
     items = []
     try:
-        with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=8.0) as client:
-            res = client.get(feed_url)
-            if res.status_code != 200:
-                return items
-            feed = feedparser.parse(res.content)
-            if feed.bozo and not feed.entries:
-                return items
-            for entry in feed.entries[:4]:
-                title = entry.get("title", "").strip()
-                if not title or not is_forex_news(title):
-                    continue
-                image_url = ""
-                if entry.get("media_content"):
-                    image_url = entry.media_content[0].get("url", "")
-                elif entry.get("enclosures"):
-                    image_url = entry.enclosures[0].get("href", "")
+        res = HTTP_CLIENT.get(feed_url)
+        if res.status_code != 200:
+            return items
+        feed = feedparser.parse(res.content)
+        if feed.bozo and not feed.entries:
+            return items
+        for entry in feed.entries[:4]:
+            title = entry.get("title", "").strip()
+            if not title or not is_forex_news(title):
+                continue
+            image_url = ""
+            if entry.get("media_content"):
+                image_url = entry.media_content[0].get("url", "")
+            elif entry.get("enclosures"):
+                image_url = entry.enclosures[0].get("href", "")
 
-                content_text = ""
-                if entry.get("content"):
-                    content_text = entry.content[0].get("value", "")
-                elif entry.get("summary"):
-                    content_text = entry.summary
-                elif entry.get("description"):
-                    content_text = entry.description
+            content_text = ""
+            if entry.get("content"):
+                content_text = entry.content[0].get("value", "")
+            elif entry.get("summary"):
+                content_text = entry.summary
+            elif entry.get("description"):
+                content_text = entry.description
 
-                pub_ms = parse_entry_timestamp(entry)
-                arrival_ms = int(time.time() * 1000)
+            pub_ms = parse_entry_timestamp(entry)
+            arrival_ms = int(time.time() * 1000)
 
-                items.append({
-                    "doc_id": generate_doc_id(title, source_name),
-                    "title": title,
-                    "link": entry.get("link", "#"),
-                    "published": entry.get("published", entry.get("updated", "recent")),
-                    "source": source_name,
-                    "image": image_url,
-                    "content": content_text,
-                    "impact": get_impact_level(title),
-                    "tags": extract_currencies_and_tags(title),
-                    "sentiment": analyze_market_sentiment(title),
-                    "target_timestamp": None,
-                    "created_at_ms": pub_ms,
-                    "server_received_at_ms": arrival_ms,
-                })
+            items.append({
+                "doc_id": generate_doc_id(title, source_name),
+                "title": title,
+                "link": entry.get("link", "#"),
+                "published": entry.get("published", entry.get("updated", "recent")),
+                "source": source_name,
+                "image": image_url,
+                "content": content_text,
+                "impact": get_impact_level(title),
+                "tags": extract_currencies_and_tags(title),
+                "sentiment": analyze_market_sentiment(title),
+                "target_timestamp": None,
+                "created_at_ms": pub_ms,
+                "server_received_at_ms": arrival_ms,
+            })
     except Exception as e:
         print(f"⚠ Feed {source_name} error: {e}")
     return items
 
 
 def save_batch_chunked(items):
+    if not db or not items:
+        return
     CHUNK = 200
     for i in range(0, len(items), CHUNK):
         batch = db.batch()
@@ -564,151 +619,204 @@ def save_batch_chunked(items):
         batch.commit()
 
 
-def fetch_calendar(current_time_ms):
+def save_async_firestore(items):
+    if not db or not items:
+        return
+
+    def _run():
+        try:
+            to_save = [{k: v for k, v in it.items() if not k.startswith("_")} for it in items]
+            save_batch_chunked(to_save)
+        except Exception as e:
+            print("❌ Async Firestore Sync Error:", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# --- دالة جلب التقويم المحدثة لتغطي الأسبوع كاملاً (من السبت إلى الجمعة) ---
+def fetch_calendar(current_time_ms=None):
+    if current_time_ms is None:
+        current_time_ms = int(time.time() * 1000)
     items = []
     try:
-        with httpx.Client(headers=HEADERS, timeout=8.0) as client:
-            cal_res = client.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
-            if cal_res.status_code != 200:
-                return items
+        cal_res = HTTP_CLIENT.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=6.0)
+        if cal_res.status_code != 200:
+            return items
 
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            days_since_saturday = (now_dt.weekday() - 5) % 7
-            saturday_start = (now_dt - datetime.timedelta(days=days_since_saturday)).replace(hour=0, minute=0, second=0, microsecond=0)
-            friday_end = saturday_start + datetime.timedelta(days=6, hours=23, minutes=59, seconds=59)
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        days_since_saturday = (now_dt.weekday() - 5) % 7
+        saturday_start = (now_dt - datetime.timedelta(days=days_since_saturday)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        friday_end = saturday_start + datetime.timedelta(days=6, hours=23, minutes=59, seconds=59)
 
-            saturday_ms = int(saturday_start.timestamp() * 1000)
-            friday_ms = int(friday_end.timestamp() * 1000)
+        saturday_ms = int(saturday_start.timestamp() * 1000)
+        friday_ms = int(friday_end.timestamp() * 1000)
 
-            for ev in cal_res.json():
-                if ev.get("impact") not in ("High", "Medium"):
+        for ev in cal_res.json():
+            if ev.get("impact") not in ("High", "Medium"):
+                continue
+            try:
+                dt = datetime.datetime.fromisoformat(ev.get("date", "").replace("Z", "+00:00"))
+                event_ts = int(dt.timestamp() * 1000)
+
+                if not (saturday_ms <= event_ts <= friday_ms):
                     continue
-                try:
-                    dt = datetime.datetime.fromisoformat(ev.get("date", "").replace("Z", "+00:00"))
-                    event_ts = int(dt.timestamp() * 1000)
 
-                    if not (saturday_ms <= event_ts <= friday_ms):
-                        continue
+                news_title = f"{ev.get('country')} - {ev.get('title')}"
+                day_name = dt.strftime("%A")
+                date_str = dt.strftime("%Y-%m-%d")
 
-                    news_title = f"{ev.get('country')} - {ev.get('title')}"
-                    day_name = dt.strftime("%A")
-                    date_str = dt.strftime("%Y-%m-%d")
-
-                    items.append({
-                        "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
-                        "title": news_title,
-                        "link": "https://www.forexfactory.com/calendar",
-                        "published": f"موعد الصدور: {ev.get('date')}",
-                        "source": "Forex Factory Calendar",
-                        "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
-                        "content": f"الحدث الاقتصادي: {news_title} | المتوقع: {ev.get('forecast', 'N/A')} | السابق: {ev.get('previous', 'N/A')}",
-                        "impact": "high" if ev.get("impact") == "High" else "medium",
-                        "tags": [ev.get("country", "USD"), day_name],
-                        "sentiment": "neutral",
-                        "target_timestamp": event_ts,
-                        "created_at_ms": current_time_ms,
-                        "server_received_at_ms": current_time_ms,
-                        "calendar_date": date_str,
-                        "calendar_day": day_name,
-                        "_forecast": str(ev.get("forecast", "")),
-                        "_previous": str(ev.get("previous", "")),
-                        "_date": str(ev.get("date", "")),
-                    })
-                except Exception:
-                    continue
+                items.append({
+                    "doc_id": generate_doc_id(f"{news_title}|{event_ts}", "Forex Factory Calendar"),
+                    "title": news_title,
+                    "link": "https://www.forexfactory.com/calendar",
+                    "published": f"موعد الصدور: {ev.get('date')}",
+                    "source": "Forex Factory Calendar",
+                    "image": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=600&q=80",
+                    "content": f"الحدث الاقتصادي: {news_title} | المتوقع: {ev.get('forecast', 'N/A')} | السابق: {ev.get('previous', 'N/A')}",
+                    "impact": "high" if ev.get("impact") == "High" else "medium",
+                    "tags": [ev.get("country", "USD"), day_name],
+                    "sentiment": "neutral",
+                    "target_timestamp": event_ts,
+                    "created_at_ms": current_time_ms,
+                    "server_received_at_ms": current_time_ms,
+                    "calendar_date": date_str,
+                    "calendar_day": day_name,
+                    "_forecast": str(ev.get("forecast", "")),
+                    "_previous": str(ev.get("previous", "")),
+                    "_date": str(ev.get("date", "")),
+                })
+            except Exception:
+                continue
     except Exception as e:
         print("Calendar fetch error:", e)
     return items
 
 
+def refresh_calendar_job():
+    ensure_preloaded()
+    now_ms = int(time.time() * 1000)
+    cal_items = fetch_calendar(now_ms)
+    if not cal_items:
+        return
+    with _CAL_LOCK:
+        _CALENDAR_CACHE.clear()
+        _CALENDAR_CACHE.extend(cal_items)
+
+    new_cal = [it for it in cal_items if not is_known(it["doc_id"])]
+    if new_cal:
+        push_hot_news(new_cal)
+        save_async_firestore(new_cal)
+        for it in new_cal:
+            remember(it["doc_id"])
+
+
 # ============================================================
-# 9. مهمة التحديث الرئيسية مع منع التكرار الذكي
+# 9. مهمة التحديث السريعة (كل 5 ثوانٍ) مع إرسال فوري لـ FCM
 # ============================================================
+EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=len(RSS_FEEDS))
+
+
 def update_news_cache_job():
     global _first_cycle
     ensure_preloaded()
     current_time_ms = int(time.time() * 1000)
 
     candidates = {}
+    with _CAL_LOCK:
+        for item in _CALENDAR_CACHE:
+            candidates[item["doc_id"]] = item
 
-    for item in fetch_calendar(current_time_ms):
-        candidates[item["doc_id"]] = item
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(RSS_FEEDS)) as executor:
-        futures = {executor.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                for item in future.result():
-                    title_lower = item["title"].lower()
-                    is_duplicate = False
-                    for existing in candidates.values():
-                        if existing["source"] != "Forex Factory Calendar" and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000:
-                            sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
-                            if len(sim_words) >= 4:
-                                is_duplicate = True
-                                break
-                    if not is_duplicate:
-                        candidates.setdefault(item["doc_id"], item)
-            except Exception as e:
-                print("⚠️ Feed future error:", e)
+    futures = {EXECUTOR.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
+    for future in concurrent.futures.as_completed(futures, timeout=4.5):
+        try:
+            for item in future.result():
+                title_lower = item["title"].lower()
+                is_duplicate = False
+                for existing in candidates.values():
+                    if (
+                        existing["source"] != "Forex Factory Calendar"
+                        and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000
+                    ):
+                        sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
+                        if len(sim_words) >= 4:
+                            is_duplicate = True
+                            break
+                if not is_duplicate:
+                    candidates.setdefault(item["doc_id"], item)
+        except concurrent.futures.TimeoutError:
+            continue
+        except Exception as e:
+            print("⚠️ Feed future error:", e)
 
     if not candidates:
         return
 
     new_items = [it for it in candidates.values() if not is_known(it["doc_id"])]
+    if not new_items:
+        _first_cycle = False
+        return
 
-    saved_ok = True
-    if db and new_items:
-        try:
-            to_save = [{k: v for k, v in it.items() if not k.startswith("_")} for it in new_items]
-            save_batch_chunked(to_save)
-        except Exception as e:
-            saved_ok = False
-            print("❌ Firestore Sync Error:", e)
+    push_hot_news(new_items)
+    save_async_firestore(new_items)
 
-    if saved_ok:
-        suppress = _first_cycle and _suppress_first_notify
-        for it in new_items:
-            remember(it["doc_id"])
-            if suppress:
-                continue
+    suppress = _first_cycle and _suppress_first_notify
+    for it in new_items:
+        remember(it["doc_id"])
+        if suppress:
+            continue
 
-            news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
-            if news_age_ms > 90000:
-                continue
+        news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
+        if news_age_ms > 300000:
+            continue
 
-            if it["source"] == "Forex Factory Calendar":
-                if it["impact"] == "high":
-                    notif_key = f"cal_pub_{it['doc_id']}"
-                    if not was_notification_sent(notif_key):
-                        mark_notification_sent(notif_key)
-                        send_high_impact_notification(
-                            title=it["title"],
-                            body=f"موعد الصدور المرتقب: {it['_date']}",
-                            event_data={
-                                "country": it["tags"][0] if it["tags"] else "",
-                                "forecast": it["_forecast"],
-                                "previous": it["_previous"],
-                            },
-                            is_pro_only=False,
-                        )
-            else:
-                notif_key = f"news_{it['doc_id']}"
+        if it["source"] == "Forex Factory Calendar":
+            if it["impact"] == "high":
+                notif_key = f"cal_pub_{it['doc_id']}"
                 if not was_notification_sent(notif_key):
                     mark_notification_sent(notif_key)
                     send_high_impact_notification(
                         title=it["title"],
-                        body=f"المصدر: {it['source']}",
-                        event_data={"link": it.get("link", ""), "doc_id": it["doc_id"]},
-                        is_pro_only=(it["impact"] != "high"),
+                        body=f"موعد الصدور المرتقب: {it['_date']}",
+                        event_data={
+                            "doc_id": it["doc_id"],
+                            "source": it["source"],
+                            "impact": it["impact"],
+                            "sentiment": it["sentiment"],
+                            "tags": json.dumps(it.get("tags", []), ensure_ascii=False),
+                            "published": it.get("published", ""),
+                            "country": it["tags"][0] if it["tags"] else "",
+                            "forecast": it.get("_forecast", ""),
+                            "previous": it.get("_previous", ""),
+                        },
+                        is_pro_only=False,
                     )
+        else:
+            notif_key = f"news_{it['doc_id']}"
+            if not was_notification_sent(notif_key):
+                mark_notification_sent(notif_key)
+                send_high_impact_notification(
+                    title=it["title"],
+                    body=f"المصدر: {it['source']}",
+                    event_data={
+                        "doc_id": it["doc_id"],
+                        "link": it.get("link", ""),
+                        "source": it.get("source", ""),
+                        "impact": it.get("impact", "low"),
+                        "sentiment": it.get("sentiment", "neutral"),
+                        "tags": json.dumps(it.get("tags", []), ensure_ascii=False),
+                        "published": it.get("published", ""),
+                    },
+                    is_pro_only=(it["impact"] != "high"),
+                )
 
     _first_cycle = False
-    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items saved.")
+    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items dispatched.")
 
 
 # ============================================================
-# 10. المجدول
+# 10. المجدول (معدل التحديث 5 ثوانٍ للأخبار)
 # ============================================================
 _LOCK_FH = None
 
@@ -730,88 +838,46 @@ def acquire_scheduler_lock() -> bool:
 scheduler = None
 if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler = BackgroundScheduler()
-    scheduler.add_job(update_news_cache_job, "interval", seconds=5,
-                      max_instances=1, coalesce=True,
-                      next_run_time=datetime.datetime.now())
-    scheduler.add_job(check_calendar_5min_job, "interval", seconds=60,
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(cleanup_old_news_job, "interval", days=1, max_instances=1,
-                      next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2))
+    scheduler.add_job(
+        update_news_cache_job,
+        "interval",
+        seconds=5,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.datetime.now(),
+    )
+    scheduler.add_job(
+        refresh_calendar_job,
+        "interval",
+        minutes=10,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.datetime.now(),
+    )
+    scheduler.add_job(
+        check_calendar_5min_job,
+        "interval",
+        seconds=60,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        cleanup_old_news_job,
+        "interval",
+        days=1,
+        max_instances=1,
+        next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2),
+    )
     scheduler.start()
-    print("⏱️ Scheduler started in this process.")
+    print("⏱️ Scheduler started in this process (5s news interval).")
 
 
 # ============================================================
 # 11. API Endpoints
 # ============================================================
-def _build_fallback_html(news_list: list) -> str:
-    safe_contact = html.escape(CONTACT_INFO)
-    safe_price = html.escape(SUBSCRIPTION_PRICE_USD)
-    items_html = ""
-    for item in news_list[:8]:
-        title = html.escape(str(item.get("title", "")))
-        source = html.escape(str(item.get("source", "Forex News live")))
-        published = html.escape(str(item.get("published", "")))
-        if title:
-            items_html += (
-                f"<div class='card'>"
-                f"<div class='meta'>{source} • {published}</div>"
-                f"<div class='title'>{title}</div>"
-                f"</div>"
-            )
-    if not items_html:
-        items_html = (
-            "<div class='card'>"
-            "<div class='title'>Real-time Forex &amp; Economic Calendar Feed</div>"
-            "<div class='meta'>Live market updates and high-impact event alerts</div>"
-            "</div>"
-        )
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Forex News live — Real-Time Market News &amp; Calendar</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; line-height: 1.6; }}
-    .wrap {{ max-width: 820px; margin: 0 auto; }}
-    .hero {{ background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 24px; margin-bottom: 20px; }}
-    .badge {{ display: inline-block; background: #0284c7; color: #fff; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: bold; }}
-    h1 {{ margin: 12px 0 8px; font-size: 26px; }}
-    .plan {{ background: #172554; border: 1px solid #38bdf8; border-radius: 14px; padding: 18px; margin-bottom: 20px; }}
-    .price {{ font-size: 22px; font-weight: bold; color: #38bdf8; margin: 6px 0; }}
-    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; margin-bottom: 12px; }}
-    .meta {{ color: #94a3b8; font-size: 12px; }}
-    .title {{ font-weight: bold; margin-top: 4px; }}
-    .footer {{ margin-top: 24px; padding-top: 16px; border-top: 1px solid #334155; color: #cbd5e1; font-size: 14px; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hero">
-      <span class="badge">LIVE SERVICE</span>
-      <h1>Forex News live</h1>
-      <p>Real-time foreign exchange news aggregator, economic calendar tracker, and high-impact market alerts for traders.</p>
-    </div>
-    <div class="plan">
-      <div><strong>PRO Subscription Plan</strong></div>
-      <div class="price">${safe_price} / {SUBSCRIPTION_DAYS} Days</div>
-      <div>Includes priority market alerts, extended calendar tracking, and subscriber features inside the Forex News live application.</div>
-    </div>
-    <h2>Latest Market Updates</h2>
-    {items_html}
-    <div class="footer">
-      <strong>Contact &amp; Support:</strong> {safe_contact}
-    </div>
-  </div>
-</body>
-</html>"""
-
-
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "firebase": FIREBASE_READY, "storage": "firestore"})
+    return jsonify({"ok": True, "firebase": FIREBASE_READY, "storage": "firestore+ram"})
 
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -819,8 +885,10 @@ def home():
     if request.method == "HEAD":
         return Response(status=200)
     news_list = []
-    try:
-        if db:
+    with _HOT_LOCK:
+        news_list = list(HOT_NEWS_RAM)[:20]
+    if not news_list and db:
+        try:
             ref = (
                 db.collection("articles")
                 .order_by("created_at_ms", direction=firestore.Query.DESCENDING)
@@ -828,20 +896,24 @@ def home():
                 .stream()
             )
             news_list = [doc.to_dict() for doc in ref]
-    except Exception as e:
-        print("Firestore Fetch Error:", e)
+        except Exception as e:
+            print("Firestore Fetch Error:", e)
     try:
         return render_template("index.html", news_list=news_list)
     except Exception:
-        return Response(_build_fallback_html(news_list), mimetype="text/html")
+        return jsonify({"status": "live", "message": "Pro Forex API Engine is running."})
 
 
 @app.route("/api/news", methods=["GET"])
 def get_forex_news():
     tag_filter = request.args.get("tag", "").upper()
-    data = []
+    after_ms_raw = request.args.get("after_ms", "")
+    after_ms = int(after_ms_raw) if after_ms_raw.isdigit() else 0
 
-    if db:
+    with _HOT_LOCK:
+        data = list(HOT_NEWS_RAM)[:40]
+
+    if not data and db:
         try:
             ref = (
                 db.collection("articles")
@@ -852,6 +924,9 @@ def get_forex_news():
             data = [d.to_dict() for d in ref]
         except Exception as e:
             print("Firestore news fetch error:", e)
+
+    if after_ms > 0:
+        data = [item for item in data if int(item.get("created_at_ms", 0)) > after_ms]
 
     if tag_filter:
         data = [item for item in data if tag_filter in item.get("tags", [])]
@@ -866,15 +941,17 @@ def get_forex_news():
 
 @app.route("/api/article/<doc_id>", methods=["GET"])
 def get_article_detail(doc_id):
+    with _HOT_LOCK:
+        for item in HOT_NEWS_RAM:
+            if item.get("doc_id") == doc_id:
+                return jsonify({"status": "success", "data": item})
+
     if not db:
         return jsonify({"status": "error", "message": "Database not ready"}), 500
     try:
         doc = db.collection("articles").document(doc_id).get()
         if doc.exists:
-            return jsonify({
-                "status": "success",
-                "data": doc.to_dict()
-            })
+            return jsonify({"status": "success", "data": doc.to_dict()})
         return jsonify({"status": "error", "message": "Article not found"}), 404
     except Exception as e:
         print(f"Article detail error: {e}")
