@@ -278,6 +278,7 @@ def send_high_impact_notification(title, body, event_data=None, is_pro_only=Fals
 def cleanup_old_news_job():
     if not db:
         return
+    t0 = time.perf_counter()
     try:
         cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)
         ts = int(cutoff.timestamp() * 1000)
@@ -293,10 +294,14 @@ def cleanup_old_news_job():
                 batch.delete(d.reference)
             batch.commit()
             deleted += len(docs)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
         if deleted:
-            print(f"🧹 Auto-Cleanup: Deleted {deleted} old news items.")
+            print(f"🧹 Auto-Cleanup: Deleted {deleted} old news items in {elapsed_ms:.1f} ms.")
+        else:
+            print(f"🧹 Auto-Cleanup finished in {elapsed_ms:.1f} ms (0 deleted).")
     except Exception as e:
-        print(f"❌ Error during cleanup: {e}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"❌ Error during cleanup after {elapsed_ms:.1f} ms: {e}")
 
 
 # ============================================================
@@ -305,6 +310,7 @@ def cleanup_old_news_job():
 def check_calendar_5min_job():
     if not db:
         return
+    t0 = time.perf_counter()
     try:
         now_ms = int(time.time() * 1000)
         lower_limit = now_ms + 270 * 1000
@@ -338,8 +344,11 @@ def check_calendar_5min_job():
                     is_pro_only=False,
                 )
                 print(f"⏰ Server sent 5-min calendar alert for: {title}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"⏱️ check_calendar_5min_job completed in {elapsed_ms:.1f} ms.")
     except Exception as e:
-        print(f"❌ Calendar 5min check error: {e}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"❌ Calendar 5min check error after {elapsed_ms:.1f} ms: {e}")
 
 
 # ============================================================
@@ -560,12 +569,17 @@ def is_forex_news(title):
 
 def fetch_single_feed(source_name, feed_url):
     items = []
+    t0 = time.perf_counter()
     try:
         res = HTTP_CLIENT.get(feed_url)
         if res.status_code != 200:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"⚠ Feed {source_name} HTTP {res.status_code} in {elapsed_ms:.1f} ms")
             return items
         feed = feedparser.parse(res.content)
         if feed.bozo and not feed.entries:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"⚠ Feed {source_name} parse error in {elapsed_ms:.1f} ms: {getattr(feed, 'bozo_exception', '')}")
             return items
         for entry in feed.entries[:4]:
             title = entry.get("title", "").strip()
@@ -604,7 +618,8 @@ def fetch_single_feed(source_name, feed_url):
                 "server_received_at_ms": arrival_ms,
             })
     except Exception as e:
-        print(f"⚠ Feed {source_name} error: {e}")
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"⚠ Feed {source_name} error after {elapsed_ms:.1f} ms: {e}")
     return items
 
 
@@ -624,11 +639,15 @@ def save_async_firestore(items):
         return
 
     def _run():
+        t0 = time.perf_counter()
         try:
             to_save = [{k: v for k, v in it.items() if not k.startswith("_")} for it in items]
             save_batch_chunked(to_save)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"💾 Async Firestore Sync ({len(to_save)} items) completed in {elapsed_ms:.1f} ms.")
         except Exception as e:
-            print("❌ Async Firestore Sync Error:", e)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"❌ Async Firestore Sync Error after {elapsed_ms:.1f} ms: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -638,9 +657,12 @@ def fetch_calendar(current_time_ms=None):
     if current_time_ms is None:
         current_time_ms = int(time.time() * 1000)
     items = []
+    t0 = time.perf_counter()
     try:
         cal_res = HTTP_CLIENT.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=6.0)
         if cal_res.status_code != 200:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"Calendar fetch HTTP {cal_res.status_code} in {elapsed_ms:.1f} ms")
             return items
 
         now_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -687,136 +709,159 @@ def fetch_calendar(current_time_ms=None):
                     "_previous": str(ev.get("previous", "")),
                     "_date": str(ev.get("date", "")),
                 })
-            except Exception:
+            except Exception as ev_err:
+                print(f"Calendar event parse error: {ev_err}")
                 continue
     except Exception as e:
-        print("Calendar fetch error:", e)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"Calendar fetch error after {elapsed_ms:.1f} ms: {e}")
     return items
 
 
 def refresh_calendar_job():
-    ensure_preloaded()
-    now_ms = int(time.time() * 1000)
-    cal_items = fetch_calendar(now_ms)
-    if not cal_items:
-        return
-    with _CAL_LOCK:
-        _CALENDAR_CACHE.clear()
-        _CALENDAR_CACHE.extend(cal_items)
+    t0 = time.perf_counter()
+    try:
+        ensure_preloaded()
+        now_ms = int(time.time() * 1000)
+        cal_items = fetch_calendar(now_ms)
+        if not cal_items:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"📅 refresh_calendar_job finished in {elapsed_ms:.1f} ms (0 items).")
+            return
+        with _CAL_LOCK:
+            _CALENDAR_CACHE.clear()
+            _CALENDAR_CACHE.extend(cal_items)
 
-    new_cal = [it for it in cal_items if not is_known(it["doc_id"])]
-    if new_cal:
-        push_hot_news(new_cal)
-        save_async_firestore(new_cal)
-        for it in new_cal:
-            remember(it["doc_id"])
+        new_cal = [it for it in cal_items if not is_known(it["doc_id"])]
+        if new_cal:
+            push_hot_news(new_cal)
+            save_async_firestore(new_cal)
+            for it in new_cal:
+                remember(it["doc_id"])
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"📅 refresh_calendar_job completed in {elapsed_ms:.1f} ms ({len(new_cal)} new).")
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"❌ refresh_calendar_job error after {elapsed_ms:.1f} ms: {e}")
 
 
 # ============================================================
-# 9. مهمة التحديث السريعة (كل 5 ثوانٍ) مع إرسال فوري لـ FCM
+# 9. مهمة التحديث السريعة (كل 10 ثوانٍ) مع إرسال فوري لـ FCM
 # ============================================================
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=len(RSS_FEEDS))
 
 
 def update_news_cache_job():
     global _first_cycle
-    ensure_preloaded()
-    current_time_ms = int(time.time() * 1000)
+    t0 = time.perf_counter()
+    try:
+        ensure_preloaded()
+        current_time_ms = int(time.time() * 1000)
 
-    candidates = {}
-    with _CAL_LOCK:
-        for item in _CALENDAR_CACHE:
-            candidates[item["doc_id"]] = item
+        candidates = {}
+        with _CAL_LOCK:
+            for item in _CALENDAR_CACHE:
+                candidates[item["doc_id"]] = item
 
-    futures = {EXECUTOR.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
-    for future in concurrent.futures.as_completed(futures, timeout=4.5):
-        try:
-            for item in future.result():
-                title_lower = item["title"].lower()
-                is_duplicate = False
-                for existing in candidates.values():
-                    if (
-                        existing["source"] != "Forex Factory Calendar"
-                        and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000
-                    ):
-                        sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
-                        if len(sim_words) >= 4:
-                            is_duplicate = True
-                            break
-                if not is_duplicate:
-                    candidates.setdefault(item["doc_id"], item)
-        except concurrent.futures.TimeoutError:
-            continue
-        except Exception as e:
-            print("⚠️ Feed future error:", e)
+        futures = {EXECUTOR.submit(fetch_single_feed, n, u): n for n, u in RSS_FEEDS.items()}
+        for future in concurrent.futures.as_completed(futures, timeout=4.5):
+            try:
+                for item in future.result():
+                    title_lower = item["title"].lower()
+                    is_duplicate = False
+                    for existing in candidates.values():
+                        if (
+                            existing["source"] != "Forex Factory Calendar"
+                            and abs(existing["created_at_ms"] - item["created_at_ms"]) < 1800000
+                        ):
+                            sim_words = set(title_lower.split()).intersection(set(existing["title"].lower().split()))
+                            if len(sim_words) >= 4:
+                                is_duplicate = True
+                                break
+                    if not is_duplicate:
+                        candidates.setdefault(item["doc_id"], item)
+            except concurrent.futures.TimeoutError:
+                print(f"⚠️ Feed future timeout for {futures.get(future, 'unknown')}")
+                continue
+            except Exception as e:
+                print("⚠️ Feed future error:", e)
 
-    if not candidates:
-        return
+        if not candidates:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            print(f"⏱️ update_news_cache_job finished in {elapsed_ms:.1f} ms (no candidates).")
+            return
 
-    new_items = [it for it in candidates.values() if not is_known(it["doc_id"])]
-    if not new_items:
-        _first_cycle = False
-        return
+        new_items = [it for it in candidates.values() if not is_known(it["doc_id"])]
+        if not new_items:
+            _first_cycle = False
+            return
 
-    push_hot_news(new_items)
-    save_async_firestore(new_items)
+        push_hot_news(new_items)
+        save_async_firestore(new_items)
 
-    suppress = _first_cycle and _suppress_first_notify
-    for it in new_items:
-        remember(it["doc_id"])
-        if suppress:
-            continue
+        suppress = _first_cycle and _suppress_first_notify
+        for it in new_items:
+            remember(it["doc_id"])
+            if suppress:
+                continue
 
-        news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
-        if news_age_ms > 300000:
-            continue
+            news_age_ms = current_time_ms - it.get("created_at_ms", current_time_ms)
+            if news_age_ms > 300000:
+                continue
 
-        if it["source"] == "Forex Factory Calendar":
-            if it["impact"] == "high":
-                notif_key = f"cal_pub_{it['doc_id']}"
+            if it["source"] == "Forex Factory Calendar":
+                if it["impact"] == "high":
+                    notif_key = f"cal_pub_{it['doc_id']}"
+                    if not was_notification_sent(notif_key):
+                        mark_notification_sent(notif_key)
+                        send_high_impact_notification(
+                            title=it["title"],
+                            body=f"موعد الصدور المرتقب: {it['_date']}",
+                            event_data={
+                                "doc_id": it["doc_id"],
+                                "source": it["source"],
+                                "impact": it["impact"],
+                                "sentiment": it["sentiment"],
+                                "tags": json.dumps(it.get("tags", []), ensure_ascii=False),
+                                "published": it.get("published", ""),
+                                "country": it["tags"][0] if it["tags"] else "",
+                                "forecast": it.get("_forecast", ""),
+                                "previous": it.get("_previous", ""),
+                            },
+                            is_pro_only=False,
+                        )
+            else:
+                notif_key = f"news_{it['doc_id']}"
                 if not was_notification_sent(notif_key):
                     mark_notification_sent(notif_key)
                     send_high_impact_notification(
                         title=it["title"],
-                        body=f"موعد الصدور المرتقب: {it['_date']}",
+                        body=f"المصدر: {it['source']}",
                         event_data={
                             "doc_id": it["doc_id"],
-                            "source": it["source"],
-                            "impact": it["impact"],
-                            "sentiment": it["sentiment"],
+                            "link": it.get("link", ""),
+                            "source": it.get("source", ""),
+                            "impact": it.get("impact", "low"),
+                            "sentiment": it.get("sentiment", "neutral"),
                             "tags": json.dumps(it.get("tags", []), ensure_ascii=False),
                             "published": it.get("published", ""),
-                            "country": it["tags"][0] if it["tags"] else "",
-                            "forecast": it.get("_forecast", ""),
-                            "previous": it.get("_previous", ""),
                         },
-                        is_pro_only=False,
+                        is_pro_only=(it["impact"] != "high"),
                     )
-        else:
-            notif_key = f"news_{it['doc_id']}"
-            if not was_notification_sent(notif_key):
-                mark_notification_sent(notif_key)
-                send_high_impact_notification(
-                    title=it["title"],
-                    body=f"المصدر: {it['source']}",
-                    event_data={
-                        "doc_id": it["doc_id"],
-                        "link": it.get("link", ""),
-                        "source": it.get("source", ""),
-                        "impact": it.get("impact", "low"),
-                        "sentiment": it.get("sentiment", "neutral"),
-                        "tags": json.dumps(it.get("tags", []), ensure_ascii=False),
-                        "published": it.get("published", ""),
-                    },
-                    is_pro_only=(it["impact"] != "high"),
-                )
 
-    _first_cycle = False
-    print(f"⚡ [{datetime.datetime.now()}] Engine Refreshed: {len(new_items)} new items dispatched.")
+        _first_cycle = False
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"⚡ [{datetime.datetime.now()}] Engine Refreshed in {elapsed_ms:.1f} ms: "
+            f"{len(new_items)} new items dispatched."
+        )
+    except Exception as e:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"❌ update_news_cache_job error after {elapsed_ms:.1f} ms: {e}")
 
 
 # ============================================================
-# 10. المجدول (معدل التحديث 5 ثوانٍ للأخبار)
+# 10. المجدول (معدل التحديث 10 ثوانٍ للأخبار)
 # ============================================================
 _LOCK_FH = None
 
@@ -841,7 +886,7 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
     scheduler.add_job(
         update_news_cache_job,
         "interval",
-        seconds=5,
+        seconds=10,
         max_instances=1,
         coalesce=True,
         next_run_time=datetime.datetime.now(),
@@ -869,7 +914,7 @@ if os.environ.get("ENABLE_SCHEDULER", "1") == "1" and acquire_scheduler_lock():
         next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=2),
     )
     scheduler.start()
-    print("⏱️ Scheduler started in this process (5s news interval).")
+    print("⏱️ Scheduler started in this process (10s news interval).")
 
 
 # ============================================================
